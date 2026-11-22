@@ -111,3 +111,23 @@ Settings and history live in `%APPDATA%\Aperture`.
 - Windows doesn't let normal apps see keys pressed inside an *admin* window. While an elevated app has focus, Windows' own Win+Shift+S runs instead.
 - Captures are physical-pixel exact on mixed-DPI multi-monitor setups.
 - There's not setting to change resolution for recording, only 30/60 FPS for now.
+
+## The Philosophy behind Aperture & Upcoming Features
+
+**Vibe Coded Slop?**
+
+Yes, it is. I vibe coded this app to serve as solution over my personal issues with Windows' Snip being very slow and unstable. It didn't do what I want it to do, it didn't have features that KDE Plasma's Screenshot does. If you don't like that, no need to use it :)  I hope this can serve as solution for many people like me, or just wanted a lightweight alternative.
+
+**The Core Philosophy**
+
+Aperture's many features is modeled after KDE Plasma's Screenshot, and the UI design is created with the goal to be: ultra lightweight, simple, and sleek. No need for fancy decoration, but still serves a functional purpose in both look and feeling.
+
+The icons & roundness is both mix of modern UI design and skeuomorphic icon design. I did it like this because that's what I like. If you don't like anything about it, you can take the source code and modify it to your liking. That's why Aperture is open source, for modifaction & security purposes.
+
+If you don't feel safe or doesn't trust this program, simply read source code, build it yourself instead of using the readily avaliable binaries. 
+
+**Planned Features?**
+
+I might be adding settings for changing resolution on recording, as well allow for more freedom in changing time for Replay clips to be whatever instead of incremental increase/decrease.
+
+Like I had previously said, Aperture is designed to solve my personal problems. Beyond all current features of Aperture, I don't really think there's anything else that I feel I should add or even have any idea in general. I feel all features that's currently avaliable in 1.0.2 of Aperture should enough for everybody. Screenshotting, recording, replay clips of something from past, with quick tools for modifying images & clipboard history, settings to change keybinds. I think this app really have everything that is probably needed for fast & functionally taking pictures/videos.
