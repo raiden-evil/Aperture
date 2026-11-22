@@ -3,6 +3,8 @@
 An ultra-lightweight screenshot and screen-recording tool for Windows 10/11, written in Rust with raw Win32, GDI+, Direct3D 11 and Media Foundation.
 It has no UI framework and no third-party runtime dependencies. It ships as a single exe of about 760 KB that uses about 3-6 MB of RAM while idle.
 
+![alt text](aperture-demo.png)
+
 ## Build
 
 ```
@@ -17,7 +19,7 @@ copy target\release\Aperture.exe dist\Aperture-Setup.exe
 
 ## What if I wanted to install instead? (Installation)
 
-1. Go to **`releases/latest`** (or look at Releases on side of Aperture repo and click the latest build). The install includes binary for installer, if you don't trust it, just build it yourself following the build instructions above.
+1. Go to **[Releases/latest](https://github.com/raiden-evil/aperture/releases/latest)** (or look at Releases on side of Aperture repo and click the latest build). The install includes binary for installer, if you don't trust it, just build it yourself following the build instructions above.
 
 You can also download the Installer from **`dist/Aperture-Setup.exe`** (a single file), OR go to Releases and download latest version.
 2. Double-click it and press **Install**. No admin rights are needed.
