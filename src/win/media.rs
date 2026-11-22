@@ -31,21 +31,33 @@ pub struct Out {
     pub rect: RECT,
     rotated: bool,
     pub hdr: bool,
+    /// brightness of SDR white ("SDR content brightness" in Windows settings)
     pub sdr_nits: f32,
+    /// brightest the panel shows (Windows HDR Calibration profile, else the monitor's report)
     pub max_nits: f32,
+    /// where the two values came from, for `--hdr-info`
+    pub source: String,
 }
 
-unsafe fn sdr_white_nits(name: &[u16; 32]) -> f32 {
+/// One active display path: its GDI name ("\\.\DISPLAY1"), SDR white level and ids.
+struct PathInfo {
+    name: Vec<u16>,
+    white: Option<f32>,
+    adapter: windows::Win32::Foundation::LUID,
+    source_id: u32,
+}
+
+unsafe fn display_paths() -> Vec<PathInfo> {
     let (mut np, mut nm) = (0u32, 0u32);
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
-        return 80.0;
+        return Vec::new();
     }
     let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![std::mem::zeroed(); np as usize];
     let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![std::mem::zeroed(); nm as usize];
     if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None) != ERROR_SUCCESS {
-        return 80.0;
+        return Vec::new();
     }
-    let want: Vec<u16> = name.iter().copied().take_while(|c| *c != 0).collect();
+    let mut out = Vec::new();
     for p in &paths[..np as usize] {
         let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
         src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -55,24 +67,58 @@ unsafe fn sdr_white_nits(name: &[u16; 32]) -> f32 {
         if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
             continue;
         }
-        let got: Vec<u16> = src.viewGdiDeviceName.iter().copied().take_while(|c| *c != 0).collect();
-        if got != want {
-            continue;
-        }
         let mut wl: DISPLAYCONFIG_SDR_WHITE_LEVEL = std::mem::zeroed();
         wl.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
         wl.header.size = size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
         wl.header.adapterId = p.targetInfo.adapterId;
         wl.header.id = p.targetInfo.id;
-        if DisplayConfigGetDeviceInfo(&mut wl.header) == 0 && wl.SDRWhiteLevel > 0 {
-            return wl.SDRWhiteLevel as f32 / 1000.0 * 80.0;
+        // value is in thousandths of 80 nits
+        let white = (DisplayConfigGetDeviceInfo(&mut wl.header) == 0 && wl.SDRWhiteLevel > 0).then(|| wl.SDRWhiteLevel as f32 / 1000.0 * 80.0);
+        out.push(PathInfo { name: src.viewGdiDeviceName.iter().copied().take_while(|c| *c != 0).collect(), white, adapter: p.sourceInfo.adapterId, source_id: p.sourceInfo.id });
+    }
+    out
+}
+
+/// Peak and minimum luminance from the display's HDR color profile (the MHC2 tag
+/// the Windows HDR Calibration app writes). None when there is no such profile.
+unsafe fn calibrated_peak(adapter: windows::Win32::Foundation::LUID, source_id: u32) -> Option<(f32, String)> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    // ColorProfileGetDisplayDefault is Windows 11+, so look it up at run time
+    type GetDefault = unsafe extern "system" fn(u32, windows::Win32::Foundation::LUID, u32, u32, u32, *mut *mut u16) -> i32;
+    let lib = LoadLibraryW(crate::util::wz("mscms.dll").as_ptr());
+    if lib.is_null() {
+        return None;
+    }
+    let f = GetProcAddress(lib, c"ColorProfileGetDisplayDefault".as_ptr() as *const u8)?;
+    let get: GetDefault = std::mem::transmute(f);
+    let mut name: *mut u16 = std::ptr::null_mut();
+    // scope: current user (1), then system (0); type ICC (0), subtype extended display (8 = HDR)
+    let ok = [1u32, 0].iter().any(|scope| get(*scope, adapter, source_id, 0, 8, &mut name) >= 0 && !name.is_null());
+    if !ok {
+        return None;
+    }
+    let file = crate::util::from_wide(name);
+    windows_sys::Win32::Foundation::LocalFree(name as *mut _);
+    let dir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let path = if file.contains('\\') { file.clone() } else { format!("{dir}\\System32\\spool\\drivers\\color\\{file}") };
+    let icc = std::fs::read(&path).ok()?;
+    let be32 = |o: usize| icc.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let count = be32(128)? as usize;
+    for i in 0..count.min(256) {
+        let e = 132 + i * 12;
+        if icc.get(e..e + 4)? == b"MHC2" {
+            let off = be32(e + 4)? as usize;
+            // MHC2: sig, reserved, lut size, min luminance, peak luminance (s15Fixed16)
+            let peak = be32(off + 16)? as i32 as f32 / 65536.0;
+            return (peak > 1.0).then(|| (peak, file));
         }
     }
-    80.0
+    None
 }
 
 pub fn outputs() -> Vec<Out> {
     let mut v = Vec::new();
+    let mut paths: Option<Vec<PathInfo>> = None;
     unsafe {
         let Ok(f) = CreateDXGIFactory1::<IDXGIFactory1>() else { return v };
         let mut ai = 0;
@@ -86,7 +132,25 @@ pub fn outputs() -> Vec<Out> {
                         continue;
                     }
                     let hdr = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                    let sdr = if hdr { sdr_white_nits(&d.DeviceName) } else { 80.0 };
+                    let (mut sdr, mut max, mut source) = (80.0, 80.0, String::from("SDR"));
+                    if hdr {
+                        let paths = paths.get_or_insert_with(|| display_paths());
+                        let want: Vec<u16> = d.DeviceName.iter().copied().take_while(|c| *c != 0).collect();
+                        // match by name; with a single display there's no doubt either way
+                        let p = paths.iter().find(|p| p.name == want).or(if paths.len() == 1 { paths.first() } else { None });
+                        let (white, from) = match p.and_then(|p| p.white) {
+                            Some(w) => (w, "Windows SDR brightness setting"),
+                            None => (200.0, "Windows default (setting not readable)"),
+                        };
+                        let calib = p.and_then(|p| calibrated_peak(p.adapter, p.source_id));
+                        let (peak, pfrom) = match &calib {
+                            Some((pk, file)) => (*pk, format!("HDR calibration profile {file}")),
+                            None => (d.MaxLuminance, "monitor's reported peak".to_string()),
+                        };
+                        sdr = white.clamp(80.0, 1000.0);
+                        max = peak.max(sdr * 1.25);
+                        source = format!("SDR white {sdr:.0} nits ({from}), peak {max:.0} nits ({pfrom})");
+                    }
                     v.push(Out {
                         adapter: a.clone(),
                         output: o,
@@ -94,7 +158,8 @@ pub fn outputs() -> Vec<Out> {
                         rotated: d.Rotation != DXGI_MODE_ROTATION_IDENTITY && d.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED,
                         hdr,
                         sdr_nits: sdr,
-                        max_nits: d.MaxLuminance.max(sdr * 1.25),
+                        max_nits: max,
+                        source,
                     });
                 } else if let Ok(d) = o.GetDesc() {
                     if !d.AttachedToDesktop.as_bool() {
@@ -108,6 +173,7 @@ pub fn outputs() -> Vec<Out> {
                         hdr: false,
                         sdr_nits: 80.0,
                         max_nits: 80.0,
+                        source: "SDR".into(),
                     });
                 }
             }
@@ -144,6 +210,17 @@ unsafe fn duplicate(out: &IDXGIOutput, dev: &ID3D11Device) -> windows::core::Res
     out.cast::<IDXGIOutput1>()?.DuplicateOutput(dev)
 }
 
+/// `--hdr-info`: what Aperture detected for each monitor.
+pub fn hdr_report() -> String {
+    let mut s = String::from("Aperture HDR detection\r\n\r\n");
+    for o in outputs() {
+        let r = o.rect;
+        s += &format!("Monitor at {},{} ({}x{}): {}\r\n  {}\r\n\r\n", r.left, r.top, r.right - r.left, r.bottom - r.top, if o.hdr { "HDR on" } else { "HDR off" }, o.source);
+    }
+    s += "Screenshots map SDR white to full white and roll HDR highlights off up to the peak.\r\n";
+    s
+}
+
 // ---------------------------------------------------------------- HDR stills
 
 fn half_lut() -> &'static [f32] {
@@ -178,10 +255,11 @@ fn srgb_lut() -> &'static [u8] {
 }
 
 /// Soft highlight roll-off: identity below the knee, extended-Reinhard above,
-/// mapping `lw` (the brightest value present) exactly to 1.0.
+/// mapping `lw` (the brightest value present) exactly to 1.0. The knee sits high
+/// so SDR content (≤ 1.0 = SDR white) keeps its brightness.
 #[inline]
 fn tonemap(m: f32, lw: f32) -> f32 {
-    const K: f32 = 0.8;
+    const K: f32 = 0.9;
     if lw <= 1.0 || m <= K {
         return 1.0;
     }
@@ -298,21 +376,9 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
                 });
             }
         });
-    } else {
-        for y in 0..h {
-            let gy = y as i32 + oy;
-            if gy < 0 || gy >= vh {
-                continue;
-            }
-            let row = std::slice::from_raw_parts(base.add(y * pitch) as *const u32, w);
-            for x in 0..w {
-                let gx = x as i32 + ox;
-                if gx >= 0 && gx < vw {
-                    dst[gy as usize * vw as usize + gx as usize] = row[x] | 0xFF00_0000;
-                }
-            }
-        }
     }
+    // an 8-bit duplication of an HDR desktop is clipped (too bright), so the GDI
+    // capture already in `dst` is the better picture: leave it
     ctx.Unmap(&st, 0);
     Ok(())
 }
@@ -350,7 +416,7 @@ float4 ps(float4 p : SV_Position) : SV_Target {
     if (hdr > 0.5) {
         float3 l = max(c.rgb * scale, 0);
         float m = max(max(l.r, l.g), l.b);
-        const float k = 0.8;
+        const float k = 0.9;
         if (m > k && lw > 1.0) {
             float x = (m - k) / (1 - k);
             float xm = max((lw - k) / (1 - k), 1.0001);

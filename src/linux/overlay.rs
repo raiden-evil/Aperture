@@ -62,6 +62,15 @@ impl R {
         R { l: self.l.max(o.l), t: self.t.max(o.t), r: self.r.min(o.r), b: self.b.min(o.b) }
     }
 }
+impl R {
+    fn tup(&self) -> (i32, i32, i32, i32) {
+        (self.l, self.t, self.r, self.b)
+    }
+    fn union(&self, o: &R) -> R {
+        let (l, t, r, b) = crate::img::union(self.tup(), o.tup());
+        R { l, t, r, b }
+    }
+}
 fn norm(a: (i32, i32), b: (i32, i32)) -> R {
     R { l: a.0.min(b.0), t: a.1.min(b.1), r: a.0.max(b.0) + 1, b: a.1.max(b.1) + 1 }
 }
@@ -107,6 +116,12 @@ pub struct Overlay {
     dim: Vec<u32>,
     work: Vec<u32>,
     back: Vec<u32>,
+    /// annotations (lines, pencil, text), premultiplied, drawn over the screen pixels
+    layer: Vec<u32>,
+    /// part of `layer` that holds something
+    layer_box: R,
+    /// part of `work` that differs from `shot`
+    dirty: R,
     w: i32,
     h: i32,
     s: f32,
@@ -156,7 +171,7 @@ fn tip(b: Btn) -> &'static str {
         Btn::Color => "Color   C",
         Btn::Undo => "Undo   Ctrl+Z",
         Btn::Save => "Save to folder   Ctrl+S",
-        Btn::Copy => "Copy   Enter",
+        Btn::Copy => "Copy   Enter / Ctrl+C",
         Btn::Close => "Close   Esc",
         Btn::Record => "Record video   V",
         _ => "",
@@ -193,6 +208,9 @@ impl Overlay {
             dim: Vec::new(),
             work: Vec::new(),
             back: Vec::new(),
+            layer: Vec::new(),
+            layer_box: R::default(),
+            dirty: R::default(),
             w: 0,
             h: 0,
             mode,
@@ -234,6 +252,9 @@ impl Overlay {
         self.shot = resample(&self.src, w, h);
         self.dim = self.shot.iter().map(|s| ((s >> 1) & 0x007F_7F7F) | 0xFF00_0000).collect();
         self.work = self.shot.clone();
+        self.layer = vec![0; (w * h) as usize];
+        self.layer_box = R::default();
+        self.dirty = R::default();
         self.anns.clear();
         self.editing = false;
         self.drag = Drag::None;
@@ -280,19 +301,53 @@ impl Overlay {
         self.win.request_redraw();
     }
 
+    /// Where edits may land: the selection box, or (freeform) anywhere on screen,
+    /// since freeform edits may reach past the drawn shape.
+    fn edit_bounds(&self) -> R {
+        if self.mode == Mode::Free { self.full() } else { self.sel }
+    }
+
+    fn blur_rects(&self) -> Vec<R> {
+        let b = self.edit_bounds();
+        self.anns
+            .iter()
+            .chain(self.pending.iter())
+            .filter_map(|a| match a {
+                Ann::Blur(rc) | Ann::Censor(rc) => Some(rc.inter(&b)),
+                _ => None,
+            })
+            .filter(|r| r.w() > 0 && r.h() > 0)
+            .collect()
+    }
+
     fn render_work(&mut self) {
-        let r = self.sel;
+        let bound = self.edit_bounds();
+        let full = self.full();
         let stride = self.w as usize;
-        for y in r.t..r.b {
-            let o = y as usize * stride;
-            self.work[o + r.l as usize..o + r.r as usize].copy_from_slice(&self.shot[o + r.l as usize..o + r.r as usize]);
+        // undo last time's blur/black bars, then copy the area this render needs
+        let mut need = self.sel;
+        for rc in self.blur_rects() {
+            need = need.union(&rc);
         }
+        let copy = self.dirty.union(&need).inter(&full);
+        for y in copy.t..copy.b {
+            let o = y as usize * stride;
+            self.work[o + copy.l as usize..o + copy.r as usize].copy_from_slice(&self.shot[o + copy.l as usize..o + copy.r as usize]);
+        }
+        self.dirty = need;
+        let lb = self.layer_box.inter(&full);
+        for y in lb.t..lb.b {
+            let o = y as usize * stride;
+            self.layer[o + lb.l as usize..o + lb.r as usize].fill(0);
+        }
+        let mut used = R::default();
         let s = self.s;
         let anns: Vec<Ann> = self.anns.iter().chain(self.pending.iter()).cloned().collect();
+        let pad = |w: f32| (w * 3.2 + 10.0).ceil() as i32;
         for a in &anns {
             match a {
                 Ann::Blur(rc) | Ann::Censor(rc) => {
-                    let rr = rc.inter(&r);
+                    let rr = rc.inter(&bound);
                     if rr.w() <= 0 || rr.h() <= 0 {
                         continue;
                     }
@@ -307,9 +362,9 @@ impl Overlay {
                     }
                 }
                 _ => {
-                    let g = Gfx::over_slice(&mut self.work, self.w, self.h);
-                    g.clip_rect(r.l as f32, r.t as f32, r.w() as f32, r.h() as f32);
-                    match a {
+                    let g = Gfx::over_slice(&mut self.layer, self.w, self.h);
+                    g.clip_rect(bound.l as f32, bound.t as f32, bound.w() as f32, bound.h() as f32);
+                    let bx = match a {
                         Ann::Line { a, b, c, w, arrow } => {
                             if *arrow {
                                 g.arrow(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
@@ -318,6 +373,8 @@ impl Overlay {
                                 g.line(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
                                 g.line(a.0, a.1, b.0, b.1, *c, *w);
                             }
+                            let p = pad(*w);
+                            R { l: a.0.min(b.0) as i32 - p, t: a.1.min(b.1) as i32 - p, r: a.0.max(b.0) as i32 + p, b: a.1.max(b.1) as i32 + p }
                         }
                         Ann::Stroke { pts, c, w } => {
                             let mut p = pts.clone();
@@ -327,13 +384,26 @@ impl Overlay {
                             let sh: Vec<(f32, f32)> = p.iter().map(|&(x, y)| (x + 1.0, y + 1.5)).collect();
                             g.polyline(&sh, 0x50000000, *w);
                             g.polyline(&p, *c, *w);
+                            let q = pad(*w);
+                            let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                            for &(x, y) in &p {
+                                (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
+                            }
+                            R { l: l as i32 - q, t: t as i32 - q, r: r as i32 + q, b: b as i32 + q }
                         }
-                        Ann::Text { x, y, s, c, size } => draw_text_ann(&g, *x, *y, s, *c, *size),
-                        _ => {}
-                    }
+                        Ann::Text { x, y, s, c, size } => {
+                            draw_text_ann(&g, *x, *y, s, *c, *size);
+                            let (tw, th) = g.measure_at(s, *size, SEMI);
+                            let q = (*size / 6.0) as i32 + 4;
+                            R { l: *x as i32 - q, t: *y as i32 - q, r: (*x + tw) as i32 + q * 2, b: (*y + th) as i32 + q * 2 }
+                        }
+                        _ => continue,
+                    };
+                    used = used.union(&bx.inter(&bound));
                 }
             }
         }
+        self.layer_box = used.inter(&full);
     }
 
     fn layout(&mut self) {
@@ -493,6 +563,19 @@ impl Overlay {
                     buf[o + r.l as usize..o + r.r as usize].copy_from_slice(&src[o + r.l as usize..o + r.r as usize]);
                 }
             }
+        }
+        if self.editing {
+            if free {
+                // blur / black bars count as part of the shape, even past its edge
+                for r in self.blur_rects() {
+                    for y in r.t..r.b {
+                        let o = (y * w) as usize;
+                        buf[o + r.l as usize..o + r.r as usize].copy_from_slice(&self.work[o + r.l as usize..o + r.r as usize]);
+                    }
+                }
+            }
+            let lb = self.layer_box;
+            crate::img::blend_over(buf, &self.layer, w as usize, lb.l, lb.t, lb.r, lb.b);
         }
         {
             let g = Gfx::over_slice(buf, w, h);
@@ -665,32 +748,33 @@ impl Overlay {
     }
 
     fn crop(&self) -> Option<Img> {
-        let r = self.sel;
-        let (w, h) = (r.w(), r.h());
-        if w <= 0 || h <= 0 {
+        let stride = self.w as usize;
+        let mask = if self.mode == Mode::Free { self.lasso_mask() } else { None };
+        let Some(mask) = mask else {
+            let r = self.sel;
+            if r.w() <= 0 || r.h() <= 0 {
+                return None;
+            }
+            return Some(crate::img::compose(&self.work, &self.layer, stride, (r.l, r.t, r.w(), r.h()), |_, _| 255));
+        };
+        // freeform: the shape plus whatever was drawn past its edge
+        let blurs = self.blur_rects();
+        let mut r = self.sel.union(&self.layer_box);
+        for b in &blurs {
+            r = r.union(b);
+        }
+        let r = r.inter(&self.full());
+        if r.w() <= 0 || r.h() <= 0 {
             return None;
         }
-        let stride = self.w as usize;
-        let mut px = Vec::with_capacity((w * h) as usize);
-        for y in r.t..r.b {
-            let o = y as usize * stride + r.l as usize;
-            px.extend(self.work[o..o + w as usize].iter().map(|p| p | 0xFF00_0000));
-        }
-        let mut alpha = false;
-        if self.mode == Mode::Free {
-            if let Some(m) = self.lasso_mask() {
-                let md = m.data();
-                for y in 0..h {
-                    for x in 0..w {
-                        let a = md[((y + r.t) as usize) * stride + (x + r.l) as usize] as u32;
-                        let p = &mut px[(y * w + x) as usize];
-                        *p = (*p & 0x00FF_FFFF) | (a << 24);
-                    }
-                }
-                alpha = true;
+        let md = mask.data();
+        let cover = |x: i32, y: i32| {
+            if blurs.iter().any(|b| b.has(x, y)) {
+                return 255;
             }
-        }
-        Some(Img { w, h, px, alpha })
+            md[y as usize * stride + x as usize] as u32
+        };
+        Some(crate::img::compose(&self.work, &self.layer, stride, (r.l, r.t, r.w(), r.h()), cover))
     }
 
     fn finish(&mut self, how: Out) -> Option<Done> {
@@ -742,7 +826,7 @@ impl Overlay {
     }
 
     fn clamp_pt(&self, x: i32, y: i32) -> (f32, f32) {
-        let r = self.sel;
+        let r = self.edit_bounds();
         (x.clamp(r.l, r.r - 1) as f32 + 0.5, y.clamp(r.t, r.b - 1) as f32 + 0.5)
     }
 
@@ -772,7 +856,7 @@ impl Overlay {
                     }
                 }
                 Tool::Text => {
-                    if inside {
+                    if inside || self.mode == Mode::Free {
                         let size = 26.0 * self.s;
                         self.text = Some(TextEdit { x: x as f32, y: y as f32 - size * 0.62, s: String::new() });
                     }
@@ -956,6 +1040,18 @@ impl Overlay {
 
     fn on_key(&mut self, key: &Key, text: Option<&str>) -> Option<Done> {
         let ctrl = self.mods.control_key();
+        let ch = match key {
+            Key::Character(c) => c.to_lowercase().chars().next(),
+            _ => None,
+        };
+        if self.text.is_some() && ctrl {
+            // Ctrl+C / Ctrl+S still finish the capture while typing (the text is kept)
+            match ch {
+                Some('c') => return self.finish(Out::Copy),
+                Some('s') => return self.finish(Out::Save),
+                _ => return None,
+            }
+        }
         if let Some(t) = &mut self.text {
             match key {
                 Key::Named(NamedKey::Backspace) => {
@@ -972,10 +1068,6 @@ impl Overlay {
             self.win.request_redraw();
             return None;
         }
-        let ch = match key {
-            Key::Character(c) => c.to_lowercase().chars().next(),
-            _ => None,
-        };
         match (key, ch) {
             (Key::Named(NamedKey::Escape), _) => {
                 if self.drag != Drag::None {

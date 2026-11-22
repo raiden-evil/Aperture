@@ -14,6 +14,7 @@ copy target\release\Aperture.exe dist\Aperture-Setup.exe
 
 - `Aperture.exe --portable` runs without installing, which is handy for development.
 - `Aperture.exe --record` / `--clip` / `--region` / `--freeform` / `--full` send commands to the running Aperture.
+- `Aperture.exe --hdr-info` shows the HDR values Aperture detected for each monitor: SDR white from your "SDR content brightness" setting, and peak brightness from your Windows HDR Calibration profile.
 - `Aperture.exe --probe video.mp4 frame.png` (developer tool) decodes a frame from a video to check recordings.
 - `Aperture.exe --write-icon assets\aperture.ico` regenerates the camera icon from the vector drawing code in `src/icons.rs`. Rebuild afterwards to embed it.
 

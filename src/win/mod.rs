@@ -37,6 +37,12 @@ pub fn main() {
                 }
                 return;
             }
+            "--hdr-info" => {
+                let path = std::env::temp_dir().join("aperture-hdr.txt");
+                let _ = std::fs::write(&path, media::hdr_report());
+                util::open_path(&path.to_string_lossy());
+                return;
+            }
             "--uninstall" => {
                 install::uninstall();
                 return;

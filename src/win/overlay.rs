@@ -136,6 +136,12 @@ pub struct Overlay {
     mon: RECT,
     s: f32,
     record: bool,
+    /// annotations (lines, pencil, text), premultiplied, drawn over the screen pixels
+    layer: Vec<u32>,
+    /// part of `layer` that holds something
+    layer_box: RECT,
+    /// part of `work` that differs from `shot`
+    dirty: RECT,
 }
 
 pub static OV: G<Overlay> = G::new();
@@ -184,6 +190,9 @@ pub unsafe fn init(hinst: HINSTANCE) {
         mon: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         s: 1.0,
         record: false,
+        layer: Vec::new(),
+        layer_box: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        dirty: RECT { left: 0, top: 0, right: 0, bottom: 0 },
     });
 }
 
@@ -225,6 +234,15 @@ fn norm(a: (i32, i32), b: (i32, i32)) -> RECT {
 fn inter(a: &RECT, b: &RECT) -> RECT {
     RECT { left: a.left.max(b.left), top: a.top.max(b.top), right: a.right.min(b.right), bottom: a.bottom.min(b.bottom) }
 }
+fn tup(r: &RECT) -> (i32, i32, i32, i32) {
+    (r.left, r.top, r.right, r.bottom)
+}
+fn rct(t: (i32, i32, i32, i32)) -> RECT {
+    RECT { left: t.0, top: t.1, right: t.2, bottom: t.3 }
+}
+fn runion(a: &RECT, b: &RECT) -> RECT {
+    rct(crate::img::union(tup(a), tup(b)))
+}
 fn rw(r: &RECT) -> i32 {
     r.right - r.left
 }
@@ -258,7 +276,7 @@ fn tip(b: Btn) -> &'static str {
         Btn::Color => "Color   C",
         Btn::Undo => "Undo   Ctrl+Z",
         Btn::Save => "Save to folder   Ctrl+S",
-        Btn::Copy => "Copy   Enter",
+        Btn::Copy => "Copy   Enter / Ctrl+C",
         Btn::Close => "Close   Esc",
         Btn::Record => "Record video   V",
         _ => "",
@@ -282,6 +300,9 @@ impl Overlay {
         }
         (self.vx, self.vy, self.w, self.h) = (vx, vy, w, h);
         self.shot = Some(shot);
+        self.layer = vec![0; (w * h) as usize];
+        self.layer_box = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        self.dirty = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         self.dim = Some(dim);
         self.work = Some(work);
         self.back = Some(back);
@@ -319,6 +340,7 @@ impl Overlay {
         self.work = None;
         self.back = None;
         self.lasso = Vec::new();
+        self.layer = Vec::new();
         self.anns.clear();
     }
 
@@ -363,77 +385,122 @@ impl Overlay {
         unsafe { self.layout() };
     }
 
+    /// Where edits may land: the selection box, or (freeform) anywhere on screen,
+    /// since freeform edits may reach past the drawn shape.
+    fn edit_bounds(&self) -> RECT {
+        if self.mode == Mode::Free { RECT { left: 0, top: 0, right: self.w, bottom: self.h } } else { self.sel }
+    }
+
+    fn blur_rects(&self) -> Vec<RECT> {
+        let b = self.edit_bounds();
+        self.anns
+            .iter()
+            .chain(self.pending.iter())
+            .filter_map(|a| match a {
+                Ann::Blur(rc) | Ann::Censor(rc) => Some(inter(rc, &b)),
+                _ => None,
+            })
+            .filter(|r| rw(r) > 0 && rh(r) > 0)
+            .collect()
+    }
+
     unsafe fn render_work(&mut self) {
         let (Some(shot), Some(work)) = (&self.shot, &self.work) else { return };
         GdiFlush();
-        let r = self.sel;
+        let bound = self.edit_bounds();
+        let full = RECT { left: 0, top: 0, right: self.w, bottom: self.h };
         let stride = self.w as usize;
         let (sp, wp) = (shot.px(), work.px());
-        for y in r.top..r.bottom {
-            let o = y as usize * stride;
-            wp[o + r.left as usize..o + r.right as usize].copy_from_slice(&sp[o + r.left as usize..o + r.right as usize]);
+        // undo last time's blur/black bars, then copy the area this render needs
+        let mut need = self.sel;
+        for rc in self.blur_rects() {
+            need = runion(&need, &rc);
         }
-        let mut g: Option<Gfx> = None;
-        for a in self.anns.iter().chain(self.pending.iter()) {
-            match a {
-                Ann::Blur(rc) | Ann::Censor(rc) => {
-                    if let Some(gg) = g.take() {
-                        GdipFlush(gg.0, 1);
-                    }
-                    GdiFlush();
-                    let rr = inter(rc, &r);
-                    if rw(&rr) <= 0 || rh(&rr) <= 0 {
-                        continue;
-                    }
-                    if let Ann::Blur(_) = a {
-                        let rad = ((rw(&rr).min(rh(&rr)) / 5).clamp(4, 14) as f32 * self.s.max(1.0)) as usize;
-                        box_blur(wp, stride, &rr, rad);
-                    } else {
-                        for y in rr.top..rr.bottom {
-                            let o = y as usize * stride;
-                            wp[o + rr.left as usize..o + rr.right as usize].fill(0xFF00_0000);
+        let copy = inter(&runion(&self.dirty, &need), &full);
+        for y in copy.top..copy.bottom {
+            let o = y as usize * stride;
+            wp[o + copy.left as usize..o + copy.right as usize].copy_from_slice(&sp[o + copy.left as usize..o + copy.right as usize]);
+        }
+        self.dirty = need;
+        // clear the annotation layer where it was used
+        let lb = inter(&self.layer_box, &full);
+        for y in lb.top..lb.bottom {
+            let o = y as usize * stride;
+            self.layer[o + lb.left as usize..o + lb.right as usize].fill(0);
+        }
+        let mut used = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let bmp = bitmap_over(self.w, self.h, self.layer.as_mut_ptr(), PF_PARGB);
+        {
+            let mut g: Option<Gfx> = None;
+            for a in self.anns.iter().chain(self.pending.iter()) {
+                let pad = |w: f32| (w * 3.2 + 10.0).ceil() as i32;
+                match a {
+                    Ann::Blur(rc) | Ann::Censor(rc) => {
+                        let rr = inter(rc, &bound);
+                        if rw(&rr) <= 0 || rh(&rr) <= 0 {
+                            continue;
+                        }
+                        if let Ann::Blur(_) = a {
+                            let rad = ((rw(&rr).min(rh(&rr)) / 5).clamp(4, 14) as f32 * self.s.max(1.0)) as usize;
+                            box_blur(wp, stride, &rr, rad);
+                        } else {
+                            for y in rr.top..rr.bottom {
+                                let o = y as usize * stride;
+                                wp[o + rr.left as usize..o + rr.right as usize].fill(0xFF00_0000);
+                            }
                         }
                     }
-                }
-                Ann::Line { a, b, c, w, arrow } => {
-                    let gg = g.get_or_insert_with(|| {
-                        let gg = Gfx::from_hdc(work.dc);
-                        gg.clip_rect(r.left as f32, r.top as f32, rw(&r) as f32, rh(&r) as f32);
-                        gg
-                    });
-                    if *arrow {
-                        gg.arrow(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
-                        gg.arrow(a.0, a.1, b.0, b.1, *c, *w);
-                    } else {
-                        gg.line(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
-                        gg.line(a.0, a.1, b.0, b.1, *c, *w);
+                    _ => {
+                        let gg = g.get_or_insert_with(|| {
+                            let gg = Gfx::from_image(bmp);
+                            gg.clip_rect(bound.left as f32, bound.top as f32, rw(&bound) as f32, rh(&bound) as f32);
+                            gg
+                        });
+                        let bx = match a {
+                            Ann::Line { a, b, c, w, arrow } => {
+                                if *arrow {
+                                    gg.arrow(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
+                                    gg.arrow(a.0, a.1, b.0, b.1, *c, *w);
+                                } else {
+                                    gg.line(a.0 + 1.0, a.1 + 1.5, b.0 + 1.0, b.1 + 1.5, 0x50000000, *w);
+                                    gg.line(a.0, a.1, b.0, b.1, *c, *w);
+                                }
+                                let p = pad(*w);
+                                RECT { left: a.0.min(b.0) as i32 - p, top: a.1.min(b.1) as i32 - p, right: a.0.max(b.0) as i32 + p, bottom: a.1.max(b.1) as i32 + p }
+                            }
+                            Ann::Stroke { pts, c, w } => {
+                                let mut p = pts.clone();
+                                if p.len() == 1 {
+                                    p.push((p[0].0 + 0.1, p[0].1 + 0.1));
+                                }
+                                let sh: Vec<(f32, f32)> = p.iter().map(|&(x, y)| (x + 1.0, y + 1.5)).collect();
+                                gg.polyline(&sh, 0x50000000, *w);
+                                gg.polyline(&p, *c, *w);
+                                let q = pad(*w);
+                                let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                                for &(x, y) in &p {
+                                    (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
+                                }
+                                RECT { left: l as i32 - q, top: t as i32 - q, right: r as i32 + q, bottom: b as i32 + q }
+                            }
+                            Ann::Text { x, y, s, c, size } => {
+                                draw_text_ann(gg, *x, *y, s, *c, *size);
+                                let (tw, th) = gg.measure_at(s, *size, SEMI);
+                                let q = (*size / 6.0) as i32 + 4;
+                                RECT { left: *x as i32 - q, top: *y as i32 - q, right: (*x + tw) as i32 + q * 2, bottom: (*y + th) as i32 + q * 2 }
+                            }
+                            _ => continue,
+                        };
+                        used = runion(&used, &inter(&bx, &bound));
                     }
-                }
-                Ann::Stroke { pts, c, w } => {
-                    let gg = g.get_or_insert_with(|| {
-                        let gg = Gfx::from_hdc(work.dc);
-                        gg.clip_rect(r.left as f32, r.top as f32, rw(&r) as f32, rh(&r) as f32);
-                        gg
-                    });
-                    let mut p = pts.clone();
-                    if p.len() == 1 {
-                        p.push((p[0].0 + 0.1, p[0].1 + 0.1));
-                    }
-                    let sh: Vec<(f32, f32)> = p.iter().map(|&(x, y)| (x + 1.0, y + 1.5)).collect();
-                    gg.polyline(&sh, 0x50000000, *w);
-                    gg.polyline(&p, *c, *w);
-                }
-                Ann::Text { x, y, s, c, size } => {
-                    let gg = g.get_or_insert_with(|| {
-                        let gg = Gfx::from_hdc(work.dc);
-                        gg.clip_rect(r.left as f32, r.top as f32, rw(&r) as f32, rh(&r) as f32);
-                        gg
-                    });
-                    draw_text_ann(gg, *x, *y, s, *c, *size);
                 }
             }
+            if let Some(gg) = g.take() {
+                GdipFlush(gg.0, 1);
+            }
         }
-        drop(g);
+        dispose(bmp);
+        self.layer_box = inter(&used, &full);
         GdiFlush();
     }
 
@@ -544,7 +611,14 @@ impl Overlay {
         };
         if self.editing {
             if self.mode == Mode::Free {
-                return lasso_rgn();
+                // blur / black bars count as part of the shape, even past its edge
+                let rgn = lasso_rgn()?;
+                for r in self.blur_rects() {
+                    let rr = CreateRectRgn(r.left, r.top, r.right, r.bottom);
+                    CombineRgn(rgn, rgn, rr, RGN_OR);
+                    DeleteObject(rr);
+                }
+                return Some(rgn);
             }
             let r = self.sel;
             return Some(CreateRectRgn(r.left, r.top, r.right, r.bottom));
@@ -568,6 +642,11 @@ impl Overlay {
             BitBlt(back.dc, 0, 0, w, h, if self.editing { work.dc } else { shot.dc }, 0, 0, SRCCOPY);
             SelectClipRgn(back.dc, null_mut());
             DeleteObject(rgn);
+        }
+        if self.editing && rw(&self.layer_box) > 0 {
+            GdiFlush();
+            let lb = self.layer_box;
+            crate::img::blend_over(back.px(), &self.layer, w as usize, lb.left, lb.top, lb.right, lb.bottom);
         }
         let g = Gfx::from_hdc(back.dc);
 
@@ -763,34 +842,42 @@ impl Overlay {
     unsafe fn crop(&self) -> Option<Img> {
         let work = self.work.as_ref()?;
         GdiFlush();
-        let r = self.sel;
+        let stride = self.w as usize;
+        let full = RECT { left: 0, top: 0, right: self.w, bottom: self.h };
+        if self.mode != Mode::Free || self.lasso.len() < 3 {
+            let r = self.sel;
+            if rw(&r) <= 0 || rh(&r) <= 0 {
+                return None;
+            }
+            return Some(crate::img::compose(work.px(), &self.layer, stride, (r.left, r.top, rw(&r), rh(&r)), |_, _| 255));
+        }
+        // freeform: the shape plus whatever was drawn past its edge
+        let mut r = self.sel;
+        r = runion(&r, &self.layer_box);
+        let blurs = self.blur_rects();
+        for b in &blurs {
+            r = runion(&r, b);
+        }
+        let r = inter(&r, &full);
         let (w, h) = (rw(&r), rh(&r));
         if w <= 0 || h <= 0 {
             return None;
         }
-        let wp = work.px();
-        let stride = self.w as usize;
-        let mut px = Vec::with_capacity((w * h) as usize);
-        for y in r.top..r.bottom {
-            let o = y as usize * stride + r.left as usize;
-            px.extend(wp[o..o + w as usize].iter().map(|p| p | 0xFF00_0000));
+        let mut mask = vec![0u32; (w * h) as usize];
+        let bmp = bitmap_over(w, h, mask.as_mut_ptr(), PF_PARGB);
+        {
+            let g = Gfx::from_image(bmp);
+            let pts: Vec<(f32, f32)> = self.lasso.iter().map(|p| ((p.x - r.left) as f32 + 0.5, (p.y - r.top) as f32 + 0.5)).collect();
+            g.fill_poly_winding(&pts, 0xFFFFFFFF);
         }
-        let mut alpha = false;
-        if self.mode == Mode::Free && self.lasso.len() >= 3 {
-            let mut mask = vec![0u32; (w * h) as usize];
-            let bmp = bitmap_over(w, h, mask.as_mut_ptr(), PF_PARGB);
-            {
-                let g = Gfx::from_image(bmp);
-                let pts: Vec<(f32, f32)> = self.lasso.iter().map(|p| ((p.x - r.left) as f32 + 0.5, (p.y - r.top) as f32 + 0.5)).collect();
-                g.fill_poly_winding(&pts, 0xFFFFFFFF);
+        dispose(bmp);
+        let cover = |x: i32, y: i32| {
+            if blurs.iter().any(|b| rect_has(b, x, y)) {
+                return 255;
             }
-            dispose(bmp);
-            for (p, m) in px.iter_mut().zip(mask.iter()) {
-                *p = (*p & 0x00FF_FFFF) | (m & 0xFF00_0000);
-            }
-            alpha = true;
-        }
-        Some(Img { w, h, px, alpha })
+            mask[((y - r.top) * w + (x - r.left)) as usize] >> 24
+        };
+        Some(crate::img::compose(work.px(), &self.layer, stride, (r.left, r.top, w, h), cover))
     }
 
     unsafe fn finish(&mut self, how: Out) {
@@ -852,7 +939,7 @@ impl Overlay {
     }
 
     fn clamp_pt(&self, x: i32, y: i32) -> (f32, f32) {
-        let r = self.sel;
+        let r = self.edit_bounds();
         (x.clamp(r.left, r.right - 1) as f32 + 0.5, y.clamp(r.top, r.bottom - 1) as f32 + 0.5)
     }
 
@@ -883,7 +970,7 @@ impl Overlay {
                     }
                 }
                 Tool::Text => {
-                    if inside {
+                    if inside || self.mode == Mode::Free {
                         let size = 26.0 * self.s;
                         self.text = Some(TextEdit { x: x as f32, y: y as f32 - size * 0.62, s: String::new() });
                     }
@@ -1061,7 +1148,13 @@ impl Overlay {
     unsafe fn on_key(&mut self, vk: u32) {
         let ctrl = GetKeyState(0x11) < 0;
         if self.text.is_some() {
-            return; // handled in WM_CHAR
+            // Ctrl+C / Ctrl+S still finish the capture while typing (the text is kept)
+            match vk {
+                0x43 if ctrl => self.finish(Out::Copy),
+                0x53 if ctrl => self.finish(Out::Save),
+                _ => {} // typing is handled in WM_CHAR
+            }
+            return;
         }
         match vk {
             0x1B => {
