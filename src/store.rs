@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub const MAX: usize = 10;
 
 pub fn dir() -> PathBuf {
-    PathBuf::from(Config::dir()).join("history")
+    PathBuf::from(Config::data_dir()).join("history")
 }
 
 pub fn thumb_of(p: &std::path::Path) -> PathBuf {

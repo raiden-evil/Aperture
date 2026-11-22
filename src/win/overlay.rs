@@ -91,11 +91,13 @@ enum Ann {
     Censor(RECT),
     Text { x: f32, y: f32, s: String, c: u32, size: f32 },
 }
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Drag {
     None,
     Select,
     Ann,
+    /// resizing the selection; edge mask: 1 left, 2 top, 4 right, 8 bottom
+    Resize(u8),
 }
 struct TextEdit {
     x: f32,
@@ -231,51 +233,7 @@ fn rh(r: &RECT) -> i32 {
 }
 
 fn box_blur(px: &mut [u32], stride: usize, r: &RECT, rad: usize) {
-    let (x0, y0) = (r.left as usize, r.top as usize);
-    let (w, h) = (rw(r).max(0) as usize, rh(r).max(0) as usize);
-    if w < 2 || h < 2 {
-        return;
-    }
-    let n = w.max(h);
-    let mut src = vec![0u32; n];
-    let mut dst = vec![0u32; n];
-    let blur = |src: &[u32], dst: &mut [u32]| {
-        let len = src.len();
-        let r = rad.min(len - 1) as isize;
-        let div = (2 * r + 1) as u32;
-        let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
-        let at = |i: isize| src[i.clamp(0, len as isize - 1) as usize];
-        for i in -r..=r {
-            let p = at(i);
-            sr += (p >> 16) & 255;
-            sg += (p >> 8) & 255;
-            sb += p & 255;
-        }
-        for i in 0..len as isize {
-            dst[i as usize] = 0xFF00_0000 | ((sr / div) << 16) | ((sg / div) << 8) | (sb / div);
-            let (a, d) = (at(i + r + 1), at(i - r));
-            sr = sr + ((a >> 16) & 255) - ((d >> 16) & 255);
-            sg = sg + ((a >> 8) & 255) - ((d >> 8) & 255);
-            sb = sb + (a & 255) - (d & 255);
-        }
-    };
-    for _ in 0..3 {
-        for y in 0..h {
-            let o = (y0 + y) * stride + x0;
-            src[..w].copy_from_slice(&px[o..o + w]);
-            blur(&src[..w], &mut dst[..w]);
-            px[o..o + w].copy_from_slice(&dst[..w]);
-        }
-        for x in 0..w {
-            for y in 0..h {
-                src[y] = px[(y0 + y) * stride + x0 + x];
-            }
-            blur(&src[..h], &mut dst[..h]);
-            for y in 0..h {
-                px[(y0 + y) * stride + x0 + x] = dst[y];
-            }
-        }
-    }
+    crate::img::box_blur(px, stride, r.left, r.top, rw(r), rh(r), rad)
 }
 
 fn draw_text_ann(g: &Gfx, x: f32, y: f32, s: &str, c: u32, size: f32) {
@@ -546,6 +504,36 @@ impl Overlay {
         rect_has(&self.bar, x, y)
     }
 
+    /// Which selection edges a press at (x, y) would grab (corners grab two).
+    fn handle_at(&self, x: i32, y: i32) -> Option<u8> {
+        if !self.editing || self.mode == Mode::Free || self.text.is_some() || self.in_bar(x, y) {
+            return None;
+        }
+        let r = self.sel;
+        let c = (11.0 * self.s).round() as i32;
+        let e = (6.0 * self.s).round() as i32;
+        let near = |a: i32, b: i32, d: i32| (a - b).abs() <= d;
+        let (l, t, rr, b) = (r.left, r.top, r.right, r.bottom);
+        for (cx, cy, m) in [(l, t, 1 | 2), (rr, t, 4 | 2), (rr, b, 4 | 8), (l, b, 1 | 8)] {
+            if near(x, cx, c) && near(y, cy, c) {
+                return Some(m);
+            }
+        }
+        let in_y = y > t && y < b;
+        let in_x = x > l && x < rr;
+        if in_y && near(x, l, e) {
+            Some(1)
+        } else if in_y && near(x, rr, e) {
+            Some(4)
+        } else if in_x && near(y, t, e) {
+            Some(2)
+        } else if in_x && near(y, b, e) {
+            Some(8)
+        } else {
+            None
+        }
+    }
+
     unsafe fn bright_rgn(&self) -> Option<HRGN> {
         let lasso_rgn = || {
             if self.lasso.len() >= 3 {
@@ -602,6 +590,20 @@ impl Overlay {
             for (cx, cy, dx, dy) in [(x, y, 1.0, 1.0), (x + rw_, y, -1.0, 1.0), (x + rw_, y + rh_, -1.0, -1.0), (x, y + rh_, 1.0, -1.0)] {
                 g.polyline(&[(cx + dx * l, cy), (cx, cy), (cx, cy + dy * l)], 0xFFFFFFFF, t);
             }
+            // edge grips (resizable once the area is chosen)
+            if self.editing && !self.record {
+                let gl = 8.0 * s;
+                if rw_ > gl * 6.0 {
+                    let mx = x + rw_ / 2.0;
+                    g.line(mx - gl, y, mx + gl, y, 0xFFFFFFFF, t);
+                    g.line(mx - gl, y + rh_, mx + gl, y + rh_, 0xFFFFFFFF, t);
+                }
+                if rh_ > gl * 6.0 {
+                    let my = y + rh_ / 2.0;
+                    g.line(x, my - gl, x, my + gl, 0xFFFFFFFF, t);
+                    g.line(x + rw_, my - gl, x + rw_, my + gl, 0xFFFFFFFF, t);
+                }
+            }
         }
 
         // size badge
@@ -648,12 +650,9 @@ impl Overlay {
 
         // toolbar / mode bar
         self.draw_bar(&g);
-        if !self.editing && !selecting {
-            let hint = match (self.record, self.mode) {
-                (true, _) => "Drag to choose what to record   ·   Click to record full screen   ·   Esc to cancel",
-                (_, Mode::Free) => "Draw around anything   ·   Esc to cancel",
-                _ => "Drag to capture   ·   Click for full screen   ·   Esc to cancel",
-            };
+        // only recording needs explaining; hide it while a tooltip would sit on top of it
+        if !self.editing && !selecting && self.record && self.hover.is_none() {
+            let hint = "Drag to choose what to record   ·   Click to record full screen   ·   Esc to cancel";
             let (tw, _) = g.measure_at(hint, 12.0 * s, 0);
             let (bw, bh) = (tw + 28.0 * s, 26.0 * s);
             let bx = (self.bar.left + self.bar.right) as f32 / 2.0 - bw / 2.0;
@@ -864,6 +863,13 @@ impl Overlay {
         if self.in_bar(x, y) {
             return;
         }
+        if let Some(m) = self.handle_at(x, y) {
+            self.commit_text();
+            self.cur = (x, y);
+            self.drag = Drag::Resize(m);
+            SetCapture(self.hwnd);
+            return;
+        }
         self.commit_text();
         self.cur = (x, y);
         if self.editing {
@@ -933,6 +939,32 @@ impl Overlay {
                     }
                 }
                 self.redraw();
+            }
+            Drag::Resize(m) => {
+                let min = (8.0 * self.s).round() as i32;
+                let mut r = self.sel;
+                if m & 1 != 0 {
+                    r.left = x.min(r.right - min).max(0);
+                }
+                if m & 4 != 0 {
+                    r.right = (x + 1).max(r.left + min).min(self.w);
+                }
+                if m & 2 != 0 {
+                    r.top = y.min(r.bottom - min).max(0);
+                }
+                if m & 8 != 0 {
+                    r.bottom = (y + 1).max(r.top + min).min(self.h);
+                }
+                let o = self.sel;
+                if (r.left, r.top, r.right, r.bottom) != (o.left, o.top, o.right, o.bottom) {
+                    self.sel = r;
+                    if self.mode == Mode::Full {
+                        self.mode = Mode::Region;
+                    }
+                    self.render_work();
+                    self.layout();
+                    self.redraw();
+                }
             }
             Drag::Ann => {
                 let p = self.clamp_pt(x, y);
@@ -1014,6 +1046,12 @@ impl Overlay {
                     }
                 }
                 self.render_work();
+                self.redraw();
+            }
+            Drag::Resize(_) => {
+                self.drag = Drag::None;
+                ReleaseCapture();
+                self.layout();
                 self.redraw();
             }
             Drag::None => {}
@@ -1098,8 +1136,16 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_SETCURSOR => {
             let c = cursor();
             let (cx, cy) = (c.x - ov.vx, c.y - ov.vy);
+            let grip = if ov.drag == Drag::None { ov.handle_at(cx, cy) } else { None };
             let id = if ov.drag == Drag::None && ov.hit(cx, cy).is_some() {
                 IDC_HAND
+            } else if let Some(m) = grip {
+                match m {
+                    3 | 12 => IDC_SIZENWSE,
+                    6 | 9 => IDC_SIZENESW,
+                    1 | 4 => IDC_SIZEWE,
+                    _ => IDC_SIZENS,
+                }
             } else if ov.in_bar(cx, cy) {
                 IDC_ARROW
             } else if ov.editing && ov.tool == Tool::Text && rect_has(&ov.sel, cx, cy) {
@@ -1125,7 +1171,7 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             0
         }
         WM_LBUTTONDBLCLK => {
-            if ov.editing && ov.tool == Tool::None && rect_has(&ov.sel, x, y) {
+            if ov.editing && ov.tool == Tool::None && rect_has(&ov.sel, x, y) && ov.handle_at(x, y).is_none() {
                 ov.finish(Out::Default);
             } else {
                 ov.on_down(x, y);

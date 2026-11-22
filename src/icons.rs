@@ -1,7 +1,7 @@
 //! Procedural skeuomorphic icons (glossy gradients, bevels, highlights).
 use crate::gfx::*;
-use crate::util::Img;
-use std::f32::consts::PI;
+use crate::img::Img;
+use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Icon {
@@ -20,7 +20,6 @@ pub enum Icon {
     Copy,
     Close,
     Record,
-    Gear,
     Folder,
 }
 
@@ -41,7 +40,7 @@ fn shifted(pts: &[(f32, f32)], dx: f32, dy: f32) -> Vec<(f32, f32)> {
 fn tube(g: &Gfx, pts: &[(f32, f32)], c: u32, w: f32) {
     g.polyline(&shifted(pts, 0.35, 0.9), 0x55000000, w + 0.3);
     g.polyline(pts, c, w);
-    g.polyline(&shifted(pts, -0.3, -0.35), 0xA0FFFFFF & 0xFFFFFFFF, w * 0.28);
+    g.polyline(&shifted(pts, -0.3, -0.35), 0xA0FFFFFF, w * 0.28);
 }
 
 pub fn draw(g: &Gfx, icon: Icon, x: f32, y: f32, s: f32) {
@@ -132,8 +131,8 @@ pub fn draw(g: &Gfx, icon: Icon, x: f32, y: f32, s: f32) {
         Icon::Pen => {
             // glossy faceted pencil
             let (tx, ty) = (4.0f32, 20.0f32);
-            let d = (0.7071f32, -0.7071f32);
-            let n = (0.7071f32, 0.7071f32);
+            let d = (FRAC_1_SQRT_2, -FRAC_1_SQRT_2);
+            let n = (FRAC_1_SQRT_2, FRAC_1_SQRT_2);
             let hw = 2.7;
             let p = |t: f32, k: f32| (tx + d.0 * t + n.0 * k, ty + d.1 * t + n.1 * k);
             let quad = |t0: f32, t1: f32, k0: f32, k1: f32| Path::poly(&[p(t0, k0), p(t1, k0), p(t1, k1), p(t0, k1)]);
@@ -208,21 +207,6 @@ pub fn draw(g: &Gfx, icon: Icon, x: f32, y: f32, s: f32) {
             g.fill(&Path::ellipse(5.5, 3.6, 13.0, 7.5), 0x48FFFFFF);
             g.line(8.6, 8.6, 15.4, 15.4, 0xFFFFFFFF, 2.2);
             g.line(15.4, 8.6, 8.6, 15.4, 0xFFFFFFFF, 2.2);
-        }
-        Icon::Gear => {
-            let mut pts = Vec::new();
-            for i in 0..8 {
-                let a0 = i as f32 * 2.0 * PI / 8.0;
-                for (da, r) in [(-0.33f32, 7.8f32), (-0.17, 10.6), (0.17, 10.6), (0.33, 7.8)] {
-                    pts.push((12.0 + r * (a0 + da).cos(), 12.0 + r * (a0 + da).sin()));
-                }
-            }
-            let gear = Path::poly(&pts);
-            g.fill_lin(&gear, (4.0, 3.0), (20.0, 21.0), 0xFFF4F5F7, 0xFF7E858F);
-            g.stroke(&gear, 0x90000000, 0.6);
-            let hub = Path::circle(12.0, 12.0, 3.6);
-            g.fill_v(&hub, 8.4, 15.6, 0xFF3A3F47, 0xFF757C87);
-            g.stroke(&hub, 0x60000000, 0.6);
         }
         Icon::Folder => {
             g.fill_v(&Path::rrect(2.0, 4.0, 8.5, 4.5, 1.5), 4.0, 8.5, 0xFFFFC94F, 0xFFE9A42A);
@@ -308,16 +292,7 @@ pub fn camera(g: &Gfx, x: f32, y: f32, s: f32) {
 }
 
 pub fn render_camera(size: i32) -> Img {
-    let mut img = Img { w: size, h: size, px: vec![0u32; (size * size) as usize], alpha: true };
-    unsafe {
-        let b = bitmap_over(size, size, img.px.as_mut_ptr(), PF_ARGB);
-        {
-            let g = Gfx::from_image(b);
-            camera(&g, 0.0, 0.0, size as f32);
-        }
-        dispose(b);
-    }
-    img
+    paint(size, size, |g| camera(g, 0.0, 0.0, size as f32))
 }
 
 /// Dev helper: `Aperture.exe --write-icon assets/aperture.ico`

@@ -1,5 +1,7 @@
-use crate::util::*;
-use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos};
+//! Settings shared by every platform: the values, their defaults and the
+//! settings.ini format. Paths, autostart and global shortcuts come from the
+//! platform backend (`config_sys`).
+pub use crate::config_sys::*;
 
 pub struct Config {
     pub copy: bool,
@@ -12,10 +14,49 @@ pub struct Config {
     pub replay: bool,
     pub replay_secs: u32,
     pub fps: u32,
+    /// maximum video height in pixels (0 = native, never upscaled)
+    pub res: u32,
     pub video_folder: String,
 }
 
 pub const CLIP_STEPS: [u32; 12] = [15, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1200, 1800];
+pub const CLIP_MIN: u32 = 5;
+pub const CLIP_MAX: u32 = 3600;
+pub const FPS_STEPS: [u32; 10] = [15, 24, 30, 48, 60, 90, 120, 144, 165, 240];
+pub const FPS_MIN: u32 = 1;
+pub const FPS_MAX: u32 = 240;
+/// Resolution presets (max output height; 0 = native).
+pub const RES_STEPS: [u32; 5] = [0, 1440, 1080, 720, 480];
+
+/// Parses a clip length: "90", "90s", "2m", "1:30", "1m30s", "1.5m".
+pub fn parse_secs(t: &str) -> Option<u32> {
+    let t = t.trim().to_ascii_lowercase().replace(' ', "");
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((m, s)) = t.split_once(':') {
+        let m: u32 = m.parse().ok()?;
+        let s: u32 = s.parse().ok()?;
+        return Some(m * 60 + s);
+    }
+    let t = t.trim_end_matches("ec").trim_end_matches("in");
+    if let Some((m, rest)) = t.split_once('m') {
+        let m: f32 = m.parse().ok()?;
+        let s: f32 = if rest.is_empty() { 0.0 } else { rest.trim_end_matches('s').parse().ok()? };
+        return Some((m * 60.0 + s).round() as u32);
+    }
+    let v: f32 = t.trim_end_matches('s').parse().ok()?;
+    Some(v.round() as u32)
+}
+
+/// Step to the next/previous preset from an arbitrary current value.
+pub fn step(steps: &[u32], cur: u32, up: bool) -> u32 {
+    if up {
+        steps.iter().copied().find(|s| *s > cur).unwrap_or(*steps.last().unwrap())
+    } else {
+        steps.iter().rev().copied().find(|s| *s < cur).unwrap_or(steps[0])
+    }
+}
 
 pub fn fmt_secs(s: u32) -> String {
     if s < 60 {
@@ -26,8 +67,6 @@ pub fn fmt_secs(s: u32) -> String {
         format!("{}:{:02} min", s / 60, s % 60)
     }
 }
-
-pub const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 pub const M_WIN: u8 = 1;
 pub const M_CTRL: u8 = 2;
@@ -63,7 +102,7 @@ impl Bind {
             return String::new();
         }
         let mut parts: Vec<String> = Vec::new();
-        for (m, n) in [(M_WIN, "Win"), (M_CTRL, "Ctrl"), (M_ALT, "Alt"), (M_SHIFT, "Shift")] {
+        for (m, n) in [(M_WIN, SUPER_NAME), (M_CTRL, "Ctrl"), (M_ALT, "Alt"), (M_SHIFT, "Shift")] {
             if self.mods & m != 0 {
                 parts.push(n.into());
             }
@@ -101,14 +140,7 @@ pub fn key_name(vk: u16) -> String {
         0x6D => "Num-",
         0x6E => "Num.",
         0x6F => "Num/",
-        _ => {
-            // punctuation: ask the active keyboard layout
-            let c = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(vk as u32, 2) } & 0xFFFF;
-            return match char::from_u32(c) {
-                Some(ch) if c != 0 => ch.to_uppercase().to_string(),
-                _ => format!("Key {vk}"),
-            };
-        }
+        _ => return key_label(vk).unwrap_or_else(|| format!("Key {vk}")),
     };
     s.into()
 }
@@ -135,32 +167,23 @@ fn parse_binds(v: &str) -> [Bind; 2] {
     out
 }
 
-/// Push the shortcuts to the keyboard hook and keep Windows' own PrtSc handler out of the way.
-pub fn apply_binds(c: &Config) {
-    crate::hook::set_binds(&c.binds);
-    crate::hook::OVERRIDE.store(c.override_keys, std::sync::atomic::Ordering::SeqCst);
-    // only the installed copy touches the Windows setting (portable/dev runs leave it alone)
-    if crate::install::running_from_install_dir() {
-        set_windows_prtsc(!windows_prtsc_wanted_off(c));
-    }
-}
-
-pub fn windows_prtsc_wanted_off(c: &Config) -> bool {
-    c.override_keys && c.binds.iter().flatten().any(|b| b.vk == 0x2C && b.mods == 0)
-}
-
 impl Config {
+    /// Where settings.ini lives.
     pub fn dir() -> String {
-        format!("{}\\Aperture", known_folder(&FOLDERID_RoamingAppData))
+        config_dir()
+    }
+    /// Where the capture history lives.
+    pub fn data_dir() -> String {
+        data_dir()
     }
     pub fn default_video_folder() -> String {
-        format!("{}\\Aperture", known_folder(&FOLDERID_Videos))
+        join(&videos_dir(), "Aperture")
     }
     pub fn replay_dir() -> std::path::PathBuf {
         std::env::temp_dir().join("Aperture").join("replay")
     }
     pub fn default_folder() -> String {
-        format!("{}\\Aperture", known_folder(&FOLDERID_Pictures))
+        join(&pictures_dir(), "Aperture")
     }
     pub fn load() -> Config {
         let mut c = Config { copy: true, save: true, folder: Self::default_folder(), override_keys: true,
@@ -169,9 +192,10 @@ impl Config {
             replay: false,
             replay_secs: 60,
             fps: 30,
+            res: 0,
             video_folder: Self::default_video_folder(),
         };
-        if let Ok(s) = std::fs::read_to_string(format!("{}\\settings.ini", Self::dir())) {
+        if let Ok(s) = std::fs::read_to_string(std::path::Path::new(&Self::dir()).join("settings.ini")) {
             for line in s.lines() {
                 if let Some((k, v)) = line.split_once('=') {
                     let v = v.trim();
@@ -183,8 +207,9 @@ impl Config {
                         "video_folder" if !v.is_empty() => c.video_folder = v.to_string(),
                         "theme" => c.theme = v.parse::<u8>().unwrap_or(0).min(2),
                         "replay" => c.replay = v == "1",
-                        "replay_secs" => c.replay_secs = v.parse::<u32>().unwrap_or(60).clamp(15, 1800),
-                        "fps" => c.fps = if v == "60" { 60 } else { 30 },
+                        "replay_secs" => c.replay_secs = v.parse::<u32>().unwrap_or(60).clamp(CLIP_MIN, CLIP_MAX),
+                        "fps" => c.fps = v.parse::<u32>().unwrap_or(30).clamp(FPS_MIN, FPS_MAX),
+                        "res" => c.res = v.parse::<u32>().unwrap_or(0).min(4320),
                         k => {
                             if let Some(i) = ACTION_KEYS.iter().position(|a| *a == k) {
                                 c.binds[i] = parse_binds(v);
@@ -201,7 +226,7 @@ impl Config {
         let _ = std::fs::create_dir_all(&d);
         let b = |v: bool| if v { "1" } else { "0" };
         let mut s = format!(
-            "copy={}\nsave={}\noverride={}\nfolder={}\nvideo_folder={}\ntheme={}\nreplay={}\nreplay_secs={}\nfps={}\n",
+            "copy={}\nsave={}\noverride={}\nfolder={}\nvideo_folder={}\ntheme={}\nreplay={}\nreplay_secs={}\nfps={}\nres={}\n",
             b(self.copy),
             b(self.save),
             b(self.override_keys),
@@ -210,29 +235,17 @@ impl Config {
             self.theme,
             b(self.replay),
             self.replay_secs,
-            self.fps
+            self.fps,
+            self.res
         );
         for (i, k) in ACTION_KEYS.iter().enumerate() {
             let [a, c] = self.binds[i];
             s += &format!("{k}={}:{},{}:{}\n", a.mods, a.vk, c.mods, c.vk);
         }
-        let _ = std::fs::write(format!("{}\\settings.ini", d), s);
+        let _ = std::fs::write(std::path::Path::new(&d).join("settings.ini"), s);
     }
 }
 
-pub fn autostart() -> bool {
-    reg_get_str(RUN_KEY, "Aperture").is_some()
-}
-
-pub fn set_autostart(on: bool) {
-    if on {
-        reg_set_str(RUN_KEY, "Aperture", &format!("\"{}\" --tray", exe_path()));
-    } else {
-        reg_del_value(RUN_KEY, "Aperture");
-    }
-}
-
-/// Windows 11 "Print Screen opens Snipping Tool" switch.
-pub fn set_windows_prtsc(windows_owns_it: bool) {
-    reg_set_dword("Control Panel\\Keyboard", "PrintScreenKeyForSnippingEnabled", windows_owns_it as u32);
+fn join(dir: &str, name: &str) -> String {
+    std::path::Path::new(dir).join(name).to_string_lossy().into_owned()
 }

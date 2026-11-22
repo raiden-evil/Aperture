@@ -49,6 +49,9 @@ fn u32le(b: &[u8], o: usize) -> u32 {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/aperture.ico");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return; // the icon/manifest resource is Windows-only
+    }
     let mut res = Vec::new();
     entry(&mut res, 0, 0, &[], 0);
 

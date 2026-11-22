@@ -17,6 +17,30 @@ copy target\release\Aperture.exe dist\Aperture-Setup.exe
 - `Aperture.exe --probe video.mp4 frame.png` (developer tool) decodes a frame from a video to check recordings.
 - `Aperture.exe --write-icon assets\aperture.ico` regenerates the camera icon from the vector drawing code in `src/icons.rs`. Rebuild afterwards to embed it.
 
+### Linux (Debian, Wayland + X11)
+
+Everything works on Linux: screenshots, annotation, history, settings, tray, global shortcuts, screen recording and replay clips.
+
+```
+sudo apt install build-essential curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you don't have Rust yet
+cargo install cargo-deb
+cargo deb                                     # builds target/debian/aperture_*.deb
+sudo apt install ./target/debian/aperture_*.deb
+```
+
+No `-dev` packages are needed: the window system libraries are loaded at runtime. The package pulls in everything else it needs.
+
+- `aperture` opens settings (and starts Aperture in the background). `aperture --region` / `--freeform` / `--full` / `--instant` / `--record` / `--clip` go to the running copy, so they also work as custom shortcuts in your desktop's keyboard settings.
+- **Video** is encoded by GStreamer (installed with the package), on the graphics card through VA-API when available, otherwise with x264. On Wayland your desktop asks which screen to share the first time and remembers it. Stop a recording with the same shortcut, the tray menu or, on X11 region recordings, the stop pill.
+- **Wayland:** capture goes through the desktop's screenshot portal, which may ask for permission the first time. Global shortcuts use the desktop's shortcut service (KDE Plasma, GNOME 48+); on older GNOME, add custom shortcuts that run the commands above.
+- **X11:** capture and shortcuts work directly, without prompts.
+- **GNOME tray icon:** needs the AppIndicator extension (`gnome-shell-extension-appindicator`).
+
+#### Code layout
+
+Shared code lives in `src/` (settings, icons, palettes, history, image maths). `src/win/` is the Windows backend and `src/linux/` is the Linux backend. Each build compiles only its own backend and that backend's crates.
+
 ## What if I wanted to install instead? (Installation)
 
 1. Go to **[Releases/latest](https://github.com/raiden-evil/aperture/releases/latest)** (or look at Releases on side of Aperture repo and click the latest build). The install includes binary for installer, if you don't trust it, just build it yourself following the build instructions above.

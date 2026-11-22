@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Name=Aperture
+GenericName=Screenshot Tool
+Comment=Capture, annotate and share screenshots
+Exec=aperture
+Icon=aperture
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;snip;annotate;
+StartupNotify=true
+Actions=region;freeform;full;instant;
+
+[Desktop Action region]
+Name=Capture region
+Exec=aperture --region
+
+[Desktop Action freeform]
+Name=Capture freeform
+Exec=aperture --freeform
+
+[Desktop Action full]
+Name=Capture full screen
+Exec=aperture --full
+
+[Desktop Action instant]
+Name=Capture all screens instantly
+Exec=aperture --instant

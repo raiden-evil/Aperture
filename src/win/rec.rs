@@ -90,7 +90,7 @@ unsafe fn begin(rect: RECT, full: bool) {
     let _ = std::fs::create_dir_all(&cfg.video_folder);
     let path = PathBuf::from(format!("{}\\Aperture Recording {}.mp4", cfg.video_folder.trim_end_matches('\\'), timestamp()));
     let wr = windows::Win32::Foundation::RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
-    match media::start_record(wr, path, cfg.fps) {
+    match media::start_record(wr, path, cfg.fps, cfg.res) {
         Ok(id) => {
             r.active = Some(Active { id, start: Instant::now(), rect, full });
             show_ui(r);

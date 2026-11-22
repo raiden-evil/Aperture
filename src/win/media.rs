@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::DeleteObject;
+use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -321,7 +321,7 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
 
 const SHADER: &str = r#"
 Texture2D<float4> src : register(t0);
-cbuffer C : register(b0) { float2 off; float hdr; float scale; float lw; float3 pad; };
+cbuffer C : register(b0) { float2 off; float hdr; float scale; float lw; float2 k; float pad; };
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -333,7 +333,20 @@ float3 enc(float3 c) {
     return lerp(hi, lo, step(c, 0.0031308));
 }
 float4 ps(float4 p : SV_Position) : SV_Target {
-    float4 c = src.Load(int3(int2(p.xy + off), 0));
+    float4 c;
+    if (k.x > 1.001 || k.y > 1.001) {
+        // downscale: box-average an n x n grid over the source footprint of this pixel
+        int nx = clamp((int)ceil(k.x), 1, 4);
+        int ny = clamp((int)ceil(k.y), 1, 4);
+        float2 o = off + (p.xy - 0.5) * k;
+        c = 0;
+        for (int j = 0; j < ny; j++)
+            for (int i = 0; i < nx; i++)
+                c += src.Load(int3(int2(o + (float2(i, j) + 0.5) * k / float2(nx, ny)), 0));
+        c /= nx * ny;
+    } else {
+        c = src.Load(int3(int2(p.xy + off), 0));
+    }
     if (hdr > 0.5) {
         float3 l = max(c.rgb * scale, 0);
         float m = max(max(l.r, l.g), l.b);
@@ -387,9 +400,7 @@ fn mf_ready() -> bool {
     *M.get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok() })
 }
 
-pub fn bitrate(w: u32, h: u32, fps: u32) -> u32 {
-    ((w as f64 * h as f64 * fps as f64 * 0.11) as u32).clamp(2_000_000, 60_000_000)
-}
+pub use crate::video::bitrate;
 
 struct SendBox<T>(T);
 unsafe impl<T> Send for SendBox<T> {}
@@ -541,6 +552,8 @@ struct Consumer {
     kind: Kind,
     off: (f32, f32),
     origin: (i32, i32), // screen coords of top-left
+    /// source pixels per output pixel (1.0 = native resolution)
+    k: (f32, f32),
     w: u32,
     h: u32,
     /// encoder input textures: (texture, BGRA or luma RTV, chroma RTV when NV12)
@@ -554,9 +567,9 @@ struct Consumer {
 }
 
 enum Cmd {
-    Record { id: u64, rect: RECT, path: PathBuf, reply: Sender<Result<(), String>> },
+    Record { id: u64, rect: RECT, path: PathBuf, res: u32, reply: Sender<Result<(), String>> },
     Stop { id: u64 },
-    Replay { secs: u32, dir: PathBuf, reply: Sender<Result<(), String>> },
+    Replay { secs: u32, res: u32, dir: PathBuf, reply: Sender<Result<(), String>> },
     StopReplay,
     SaveClip { path: PathBuf },
 }
@@ -619,11 +632,12 @@ pub fn primary_rect() -> RECT {
 // ---- public API (called from the UI thread) ----
 
 /// Starts recording `rect` (screen coords, clamped to one monitor). Returns a recording id.
-pub fn start_record(rect: RECT, path: PathBuf, fps: u32) -> Result<u64, String> {
+/// `res` caps the video height in pixels (0 = native); it never upscales.
+pub fn start_record(rect: RECT, path: PathBuf, fps: u32, res: u32) -> Result<u64, String> {
     let mon = monitor_for(&rect).ok_or("No monitor found for that area")?;
     let id = NEXT_ID.fetch_add(1, SeqCst) as u64;
     let (rtx, rrx) = channel();
-    send(mon, fps, Cmd::Record { id, rect, path, reply: rtx });
+    send(mon, fps, Cmd::Record { id, rect, path, res, reply: rtx });
     rrx.recv_timeout(Duration::from_secs(10)).map_err(|_| "The video encoder didn't start".to_string())??;
     Ok(id)
 }
@@ -632,10 +646,10 @@ pub fn stop_record(id: u64) {
     send_existing(|_| true, || Cmd::Stop { id });
 }
 
-pub fn start_replay(secs: u32, fps: u32, dir: PathBuf) -> Result<(), String> {
+pub fn start_replay(secs: u32, fps: u32, res: u32, dir: PathBuf) -> Result<(), String> {
     let mon = primary_rect();
     let (rtx, rrx) = channel();
-    send(mon, fps, Cmd::Replay { secs, dir, reply: rtx });
+    send(mon, fps, Cmd::Replay { secs, res, dir, reply: rtx });
     rrx.recv_timeout(Duration::from_secs(10)).map_err(|_| "The video encoder didn't start".to_string())?
 }
 
@@ -649,7 +663,9 @@ pub fn save_clip(path: PathBuf) {
 
 // ---- engine thread ----
 
-unsafe fn make_consumer(g: &Gpu, kind_fn: impl FnOnce(u32, u32, bool) -> Result<Kind, String>, out_rect: &RECT, rect: RECT, tick: u64) -> Result<Consumer, String> {
+pub use crate::video::scaled_size;
+
+unsafe fn make_consumer(g: &Gpu, kind_fn: impl FnOnce(u32, u32, bool) -> Result<Kind, String>, out_rect: &RECT, rect: RECT, res: u32, tick: u64) -> Result<Consumer, String> {
     let ow = out_rect.right - out_rect.left;
     let oh = out_rect.bottom - out_rect.top;
     let mut l = (rect.left - out_rect.left).clamp(0, ow);
@@ -666,13 +682,15 @@ unsafe fn make_consumer(g: &Gpu, kind_fn: impl FnOnce(u32, u32, bool) -> Result<
             if *z < max { *z += 1 } else { *a -= 1 }
         }
     }
-    let (w, h) = ((r - l) as u32, (b - t) as u32);
+    let (sw, sh) = ((r - l) as u32, (b - t) as u32);
+    let (w, h) = scaled_size(sw, sh, res);
+    let k = (sw as f32 / w as f32, sh as f32 / h as f32);
     let (pool, stage) = match nv12_targets(g, w, h) {
         Some(x) => x,
         None => (bgra_targets(g, w, h)?, None),
     };
     let kind = kind_fn(w, h, stage.is_some())?;
-    Ok(Consumer { kind, off: (l as f32, t as f32), origin: (out_rect.left + l, out_rect.top + t), w, h, pool, stage, pi: 0, start: tick, last: None })
+    Ok(Consumer { kind, off: (l as f32, t as f32), origin: (out_rect.left + l, out_rect.top + t), k, w, h, pool, stage, pi: 0, start: tick, last: None })
 }
 
 type Pool = Vec<(ID3D11Texture2D, ID3D11RenderTargetView, Option<ID3D11RenderTargetView>)>;
@@ -748,6 +766,7 @@ unsafe fn bgra_targets(g: &Gpu, w: u32, h: u32) -> Result<Pool, String> {
 struct CursorCache {
     h: isize,
     hot: (i32, i32),
+    size: (i32, i32),
 }
 
 unsafe fn render(g: &Gpu, srv: &ID3D11ShaderResourceView, hdr: (bool, f32, f32), c: &mut Consumer, cur: &mut CursorCache) -> ID3D11Texture2D {
@@ -758,7 +777,7 @@ unsafe fn render(g: &Gpu, srv: &ID3D11ShaderResourceView, hdr: (bool, f32, f32),
         Some((st, srtv, _)) => (st.clone(), srtv.clone()),
         None => (tex.clone(), out_rtv.clone()),
     };
-    let cb: [f32; 8] = [c.off.0, c.off.1, if hdr.0 { 1.0 } else { 0.0 }, hdr.1, hdr.2, 0.0, 0.0, 0.0];
+    let cb: [f32; 8] = [c.off.0, c.off.1, if hdr.0 { 1.0 } else { 0.0 }, hdr.1, hdr.2, c.k.0, c.k.1, 0.0];
     g.ctx.UpdateSubresource(&g.cb, 0, None, cb.as_ptr() as *const _, 0, 0);
     g.ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
     g.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: c.w as f32, Height: c.h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]));
@@ -778,6 +797,13 @@ unsafe fn render(g: &Gpu, srv: &ID3D11ShaderResourceView, hdr: (bool, f32, f32),
             let mut ii = ICONINFO::default();
             if GetIconInfo(HICON(ci.hCursor.0), &mut ii).is_ok() {
                 cur.hot = (ii.xHotspot as i32, ii.yHotspot as i32);
+                cur.size = (GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR));
+                let mut bm = BITMAP::default();
+                let (hb, tall) = if !ii.hbmColor.is_invalid() { (ii.hbmColor, false) } else { (ii.hbmMask, true) };
+                if !hb.is_invalid() && GetObjectW(hb.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _)) != 0 {
+                    // a monochrome cursor stacks its AND and XOR masks in one bitmap
+                    cur.size = (bm.bmWidth, if tall { bm.bmHeight / 2 } else { bm.bmHeight });
+                }
                 if !ii.hbmMask.is_invalid() {
                     let _ = DeleteObject(ii.hbmMask.into());
                 }
@@ -787,12 +813,15 @@ unsafe fn render(g: &Gpu, srv: &ID3D11ShaderResourceView, hdr: (bool, f32, f32),
             }
             cur.h = ci.hCursor.0 as isize;
         }
-        let x = ci.ptScreenPos.x - cur.hot.0 - c.origin.0;
-        let y = ci.ptScreenPos.y - cur.hot.1 - c.origin.1;
+        // positions and size follow the output scale so the pointer keeps its on-screen proportions
+        let x = ((ci.ptScreenPos.x - cur.hot.0 - c.origin.0) as f32 / c.k.0).round() as i32;
+        let y = ((ci.ptScreenPos.y - cur.hot.1 - c.origin.1) as f32 / c.k.1).round() as i32;
+        let (cw, chh) = (((cur.size.0 as f32 / c.k.0).round() as i32).max(1), ((cur.size.1 as f32 / c.k.1).round() as i32).max(1));
         if x > -64 && y > -64 && x < c.w as i32 && y < c.h as i32 {
             if let Ok(s1) = canvas.cast::<IDXGISurface1>() {
                 if let Ok(hdc) = s1.GetDC(false) {
-                    let _ = DrawIconEx(hdc, x, y, HICON(ci.hCursor.0), 0, 0, 0, None, DI_NORMAL);
+                    let scaled = c.k.0 > 1.001 || c.k.1 > 1.001;
+                    let _ = DrawIconEx(hdc, x, y, HICON(ci.hCursor.0), if scaled { cw } else { 0 }, if scaled { chh } else { 0 }, 0, None, DI_NORMAL);
                     let _ = s1.ReleaseDC(None);
                 }
             }
@@ -919,14 +948,14 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
         let mut tick: u64 = 0;
         let mut consumers: Vec<Consumer> = Vec::new();
         let mut desk: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, DXGI_FORMAT)> = None;
-        let mut cur = CursorCache { h: 0, hot: (0, 0) };
+        let mut cur = CursorCache { h: 0, hot: (0, 0), size: (32, 32) };
         let mut changed: u64 = 0;
         let mut idle_since: Option<Instant> = None;
         loop {
             // ---- commands
             while let Ok(c) = rx.try_recv() {
                 match c {
-                    Cmd::Record { id, rect, path, reply } => {
+                    Cmd::Record { id, rect, path, res, reply } => {
                         let mgr = g.mgr.clone();
                         let p2 = path.clone();
                         let r = make_consumer(
@@ -934,6 +963,7 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                             |w, h, nv12| make_writer(&p2, w, h, fps, &mgr, nv12).map(|wr| Kind::Record { id, path: p2.clone(), wr, frames: 0 }).map_err(|e| e.message()),
                             &out.rect,
                             rect,
+                            res,
                             tick,
                         );
                         match r {
@@ -962,7 +992,7 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                             }
                         }
                     }
-                    Cmd::Replay { secs, dir, reply } => {
+                    Cmd::Replay { secs, res, dir, reply } => {
                         if let Some(c) = consumers.iter_mut().find(|c| matches!(c.kind, Kind::Replay(_))) {
                             if let Kind::Replay(rp) = &mut c.kind {
                                 rp.secs = secs;
@@ -995,6 +1025,7 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                             },
                             &out.rect,
                             out.rect,
+                            res,
                             tick,
                         );
                         match r {
@@ -1051,7 +1082,7 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                         let busy = rp.busy.clone();
                         busy.fetch_add(1, SeqCst);
                         std::thread::spawn(move || {
-                            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                             let mut list = Vec::new();
                             for (p, st, j) in segs {
                                 if let Some(j) = j {
@@ -1059,7 +1090,7 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                                 }
                                 list.push((p, st));
                             }
-                            let r = unsafe { merge(&list, cutoff, fps, &path) };
+                            let r = merge(&list, cutoff, fps, &path);
                             busy.fetch_sub(1, SeqCst);
                             match r {
                                 Ok(secs) => notify(MediaEvent::Saved { path, secs, clip: true }),

@@ -1,89 +1,40 @@
-//! Aperture — ultra lightweight screenshot tool for Windows (pure Rust + Win32/GDI+).
-#![windows_subsystem = "windows"]
+//! Aperture — ultra lightweight screenshot tool (pure Rust).
+//!
+//! Shared code lives at the top level (settings, icons, palettes, history, image
+//! maths). Each platform has its own backend, and only the backend for the
+//! target being built is compiled: `win/` (Win32, GDI+, DXGI, Media Foundation)
+//! or `linux/` (Wayland + X11).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 #![allow(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc, clippy::too_many_arguments)]
 
-mod app;
-mod clip;
+// Recording, replay clips and the custom toast are Windows-only for now, so the
+// Linux build doesn't use every shared setting, icon and palette entry yet.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod config;
-mod dialog;
-mod gfx;
-mod hook;
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod icons;
-mod install;
-mod media;
-mod overlay;
-mod rec;
-mod settings;
+mod img;
 mod store;
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod theme;
-mod toast;
-mod util;
+mod video;
 
-use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+use win::{app, clip, config_sys, dialog, gfx, hook, install, media, overlay, rec, settings, toast, util};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::{config_sys, gfx};
+
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("Aperture supports Windows and Linux.");
 
 fn main() {
-    unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        gfx::startup();
-
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let a = args.first().map(String::as_str).unwrap_or("");
-        match a {
-            "--write-icon" => {
-                icons::write_ico(args.get(1).map(String::as_str).unwrap_or("assets/aperture.ico"));
-                return;
-            }
-            "--probe" => {
-                if let (Some(i), Some(o)) = (args.get(1), args.get(2)) {
-                    media::probe(i, o);
-                }
-                return;
-            }
-            "--uninstall" => {
-                install::uninstall();
-                return;
-            }
-            _ => {}
-        }
-        // Running the downloaded exe (anywhere but the install folder) = installer.
-        if a != "--portable" && !install::running_from_install_dir() {
-            install::run_installer();
-            return;
-        }
-        // Single instance: forward the request to the running copy.
-        let existing = FindWindowW(util::wz(app::MAIN_CLASS).as_ptr(), std::ptr::null());
-        if !existing.is_null() {
-            let act = args
-                .iter()
-                .map(|s| match s.as_str() {
-                    "--region" => hook::ACT_REGION,
-                    "--freeform" => hook::ACT_FREE,
-                    "--full" => hook::ACT_FULL,
-                    "--record" => hook::ACT_RECORD,
-                    "--clip" => hook::ACT_CLIP,
-                    _ => 0,
-                })
-                .max()
-                .unwrap_or(0);
-            if act == 0 {
-                if !args.iter().any(|s| s == "--tray") {
-                    PostMessageW(existing, app::WM_SHOW_SETTINGS, 0, 0);
-                }
-            } else {
-                PostMessageW(existing, app::WM_ACTION, act, 0);
-            }
-            return;
-        }
-        let mode = if args.iter().any(|s| s == "--tray") {
-            "--tray"
-        } else if args.iter().any(|s| s == "--welcome") {
-            "--welcome"
-        } else {
-            ""
-        };
-        app::run(mode);
-    }
+    #[cfg(windows)]
+    win::main();
+    #[cfg(target_os = "linux")]
+    linux::main();
 }

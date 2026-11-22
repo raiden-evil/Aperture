@@ -46,54 +46,7 @@ impl<T> G<T> {
     }
 }
 
-/// 32-bit BGRA image (0xAARRGGBB as u32).
-pub struct Img {
-    pub w: i32,
-    pub h: i32,
-    pub px: Vec<u32>,
-    pub alpha: bool,
-}
-
-impl Img {
-    /// Fast area-sampled downscale by factor `sc` (<= 1).
-    pub fn scaled(&self, sc: f32) -> Img {
-        let sc = sc.min(1.0);
-        let tw = ((self.w as f32 * sc).round() as i32).max(1);
-        let th = ((self.h as f32 * sc).round() as i32).max(1);
-        let mut px = Vec::with_capacity((tw * th) as usize);
-        let (w, h) = (self.w as usize, self.h as usize);
-        for ty in 0..th as usize {
-            let y0 = ty * h / th as usize;
-            let y1 = ((ty + 1) * h / th as usize).max(y0 + 1).min(h);
-            let sy = ((y1 - y0) / 4).max(1);
-            for tx in 0..tw as usize {
-                let x0 = tx * w / tw as usize;
-                let x1 = ((tx + 1) * w / tw as usize).max(x0 + 1).min(w);
-                let sx = ((x1 - x0) / 4).max(1);
-                let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
-                let mut y = y0;
-                while y < y1 {
-                    let mut x = x0;
-                    while x < x1 {
-                        let p = self.px[y * w + x];
-                        a += p >> 24;
-                        r += (p >> 16) & 255;
-                        g += (p >> 8) & 255;
-                        b += p & 255;
-                        n += 1;
-                        x += sx;
-                    }
-                    y += sy;
-                }
-                px.push(((a / n) << 24) | ((r / n) << 16) | ((g / n) << 8) | (b / n));
-            }
-        }
-        Img { w: tw, h: th, px, alpha: self.alpha }
-    }
-    pub fn fit(&self, maxw: i32, maxh: i32) -> Img {
-        self.scaled((maxw as f32 / self.w as f32).min(maxh as f32 / self.h as f32))
-    }
-}
+pub use crate::img::Img;
 
 pub fn known_folder(id: &GUID) -> String {
     unsafe {

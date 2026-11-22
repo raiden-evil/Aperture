@@ -177,9 +177,9 @@ pub unsafe fn replay_apply() {
         crate::media::stop_replay();
         return;
     }
-    let (secs, fps, dir) = (c.replay_secs, c.fps, Config::replay_dir());
+    let (secs, fps, res, dir) = (c.replay_secs, c.fps, c.res, Config::replay_dir());
     std::thread::spawn(move || {
-        if let Err(e) = crate::media::start_replay(secs, fps, dir) {
+        if let Err(e) = crate::media::start_replay(secs, fps, res, dir) {
             crate::media::report(crate::media::MediaEvent::Error(format!("Replay clips couldn't start: {e}")));
         }
     });

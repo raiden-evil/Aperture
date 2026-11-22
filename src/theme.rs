@@ -278,6 +278,7 @@ pub fn pal() -> &'static Pal {
 }
 
 /// Dark title-bar/border hint for our custom windows (Win11 DWM).
+#[cfg(windows)]
 pub unsafe fn apply_window(h: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     let dark: i32 = pal().dark as i32;

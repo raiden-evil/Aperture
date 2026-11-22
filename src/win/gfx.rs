@@ -301,9 +301,6 @@ impl Gfx {
             (out.Width, out.Height.max(size * 1.2))
         }
     }
-    pub fn image(&self, img: *mut GpBitmap, x: f32, y: f32, w: f32, h: f32) {
-        unsafe { GdipDrawImageRect(self.0, img as *mut GpImage, x, y, w, h) };
-    }
     pub fn image_src(&self, img: *mut GpBitmap, d: (f32, f32, f32, f32), s: (f32, f32, f32, f32)) {
         unsafe {
             GdipDrawImageRectRect(self.0, img as *mut GpImage, d.0, d.1, d.2, d.3, s.0, s.1, s.2, s.3, UnitPixel, null(), 0, null_mut());
@@ -324,6 +321,20 @@ impl Gfx {
     pub fn unclip(&self) {
         unsafe { GdipResetClip(self.0) };
     }
+}
+
+/// Draws into a new transparent `w`×`h` image (straight alpha).
+pub fn paint(w: i32, h: i32, f: impl FnOnce(&Gfx)) -> Img {
+    let mut img = Img { w, h, px: vec![0u32; (w * h) as usize], alpha: true };
+    unsafe {
+        let b = bitmap_over(w, h, img.px.as_mut_ptr(), PF_ARGB);
+        {
+            let g = Gfx::from_image(b);
+            f(&g);
+        }
+        dispose(b);
+    }
+    img
 }
 
 /// Wraps existing memory as a GDI+ bitmap (memory must outlive the bitmap).

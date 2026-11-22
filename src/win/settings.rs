@@ -40,10 +40,27 @@ enum Hit {
     Replay,
     ClipMinus,
     ClipPlus,
-    Fps(u32),
+    ClipEdit,
+    FpsMinus,
+    FpsPlus,
+    FpsEdit,
+    Res(u32),
     VideoFolder,
     OpenVideoFolder,
     Theme(u8),
+}
+
+/// A number being typed into one of the recording steppers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Field {
+    Clip,
+    Fps,
+}
+struct Edit {
+    field: Field,
+    text: String,
+    /// true until the first key: typing replaces the prefilled value
+    fresh: bool,
 }
 
 struct Thumb {
@@ -68,6 +85,7 @@ pub struct Settings {
     autostart: bool,
     tab: u8,
     recording: Option<(usize, usize)>,
+    edit: Option<Edit>,
 }
 
 static SET: G<Settings> = G::new();
@@ -173,6 +191,41 @@ fn segmented(g: &Gfx, items: &mut Vec<(Hit, [f32; 4])>, x: f32, y: f32, w: f32, 
     }
 }
 
+/// `− value +` control. Clicking the value turns it into a text field (`edit`).
+#[allow(clippy::too_many_arguments)]
+fn stepper(g: &Gfx, items: &mut Vec<(Hit, [f32; 4])>, right: f32, y: f32, value: &str, edit: Option<&Edit>, hits: (Hit, Hit, Hit), hv: Option<Hit>) {
+    let p = pal();
+    let (minus_h, val_h, plus_h) = hits;
+    let plus = [right - 28.0, y, 28.0, 28.0];
+    let val = [plus[0] - 82.0, y, 78.0, 28.0];
+    let minus = [val[0] - 32.0, y, 28.0, 28.0];
+    pill(g, minus[0], minus[1], minus[2], minus[3], "−", false, hv == Some(minus_h));
+    pill(g, plus[0], plus[1], plus[2], plus[3], "+", false, hv == Some(plus_h));
+    let field = Path::rrect(val[0], val[1], val[2], val[3], 7.0);
+    if let Some(e) = edit {
+        g.fill_v(&field, val[1], val[1] + val[3], if p.dark { 0xFF1D3357 } else { 0xFFF4F8FF }, if p.dark { 0xFF16294A } else { 0xFFE6EFFF });
+        g.stroke(&field, 0xFF2D7FF9, 1.6);
+        let (tw, _) = if e.text.is_empty() { (0.0, 0.0) } else { g.measure_at(&e.text, 12.5, SEMI) };
+        let cx = val[0] + val[2] / 2.0;
+        if e.fresh && !e.text.is_empty() {
+            g.fill(&Path::rrect(cx - tw / 2.0 - 2.0, val[1] + 6.0, tw + 4.0, val[3] - 12.0, 3.0), 0x552D7FF9);
+        }
+        g.text(&e.text, val[0], val[1], val[2], val[3], 12.5, p.text, SEMI | CENTER);
+        let caret = cx + tw / 2.0 + 1.5;
+        g.line(caret, val[1] + 7.0, caret, val[1] + val[3] - 7.0, p.link, 1.4);
+    } else {
+        let on = hv == Some(val_h);
+        if on {
+            g.fill(&field, p.hover);
+            g.stroke(&field, p.btn_line, 1.0);
+        }
+        g.text(value, val[0], val[1], val[2], val[3], 12.5, p.text, SEMI | CENTER);
+    }
+    items.push((minus_h, minus));
+    items.push((val_h, val));
+    items.push((plus_h, plus));
+}
+
 /// Miniature of the settings window in a given palette (theme picker).
 fn theme_preview(g: &Gfx, p: &Pal, x: f32, y: f32, w: f32, h: f32) {
     let win = Path::rrect(x, y, w, h, 9.0);
@@ -225,6 +278,7 @@ pub unsafe fn show() {
             autostart: false,
             tab: 0,
             recording: None,
+            edit: None,
         });
     }
     let st = SET.get();
@@ -241,6 +295,7 @@ pub unsafe fn show() {
     st.s = s;
     st.autostart = config::autostart();
     st.hover = None;
+    st.edit = None;
     let hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         wz(CLASS).as_ptr(),
@@ -587,27 +642,38 @@ impl Settings {
         g.line(rx + 14.0, py + 64.0, right, py + 64.0, p.divider, 1.0);
 
         // clip length stepper
+        let edit = self.edit.as_ref();
         let y = py + 64.0;
         g.text("Clip length", rx + 16.0, y, 160.0, 48.0, 13.0, p.text, 0);
-        let plus = [right - 28.0, y + 10.0, 28.0, 28.0];
-        let val = [plus[0] - 78.0, y + 10.0, 78.0, 28.0];
-        let minus = [val[0] - 28.0, y + 10.0, 28.0, 28.0];
-        pill(g, minus[0], minus[1], minus[2], minus[3], "−", false, hv == Some(Hit::ClipMinus));
-        pill(g, plus[0], plus[1], plus[2], plus[3], "+", false, hv == Some(Hit::ClipPlus));
-        g.text(&config::fmt_secs(cfg.replay_secs), val[0], val[1], val[2], val[3], 12.5, p.text, SEMI | CENTER);
-        items.push((Hit::ClipMinus, minus));
-        items.push((Hit::ClipPlus, plus));
+        let clip_edit = edit.filter(|e| e.field == Field::Clip);
+        stepper(g, items, right, y + 10.0, &config::fmt_secs(cfg.replay_secs), clip_edit, (Hit::ClipMinus, Hit::ClipEdit, Hit::ClipPlus), hv);
+        if clip_edit.is_some() {
+            g.text("e.g. 90, 2m, 1:30", rx + 16.0, y + 30.0, 120.0, 14.0, 10.0, p.text3, 0);
+        }
         g.line(rx + 14.0, y + 48.0, right, y + 48.0, p.divider, 1.0);
 
-        // frame rate
+        // frame rate stepper
         let y = py + 112.0;
         g.text("Frame rate", rx + 16.0, y, 160.0, 48.0, 13.0, p.text, 0);
-        let fps = [("30 fps", Hit::Fps(30)), ("60 fps", Hit::Fps(60))];
-        segmented(g, items, right - 132.0, y + 11.0, 132.0, 26.0, &fps, if cfg.fps == 60 { 1 } else { 0 }, hv);
+        let fps_edit = edit.filter(|e| e.field == Field::Fps);
+        stepper(g, items, right, y + 10.0, &format!("{} fps", cfg.fps), fps_edit, (Hit::FpsMinus, Hit::FpsEdit, Hit::FpsPlus), hv);
+        if fps_edit.is_some() {
+            g.text(&format!("{} to {}", config::FPS_MIN, config::FPS_MAX), rx + 16.0, y + 30.0, 120.0, 14.0, 10.0, p.text3, 0);
+        }
+        g.line(rx + 14.0, y + 48.0, right, y + 48.0, p.divider, 1.0);
+
+        // resolution
+        let y = py + 160.0;
+        g.text("Resolution", rx + 16.0, y, 100.0, 48.0, 13.0, p.text, 0);
+        let labels: Vec<(String, Hit)> = config::RES_STEPS.iter().map(|r| (if *r == 0 { "Native".to_string() } else { format!("{r}p") }, Hit::Res(*r))).collect();
+        let refs: Vec<(&str, Hit)> = labels.iter().map(|(l, h)| (l.as_str(), *h)).collect();
+        let sel = config::RES_STEPS.iter().position(|r| *r == cfg.res).unwrap_or(usize::MAX);
+        let sw = 226.0;
+        segmented(g, items, right - sw, y + 11.0, sw, 26.0, &refs, sel, hv);
         g.line(rx + 14.0, y + 48.0, right, y + 48.0, p.divider, 1.0);
 
         // video folder
-        let y = py + 160.0;
+        let y = py + 208.0;
         g.text("Save videos to", rx + 16.0, y + 8.0, 180.0, 18.0, 13.0, p.text, 0);
         g.text(&cfg.video_folder, rx + 16.0, y + 30.0, rwid - 32.0 - 130.0, 18.0, 11.5, p.text2, PATH_TRIM);
         let b1 = [right - 122.0, y + 14.0, 66.0, 28.0];
@@ -619,7 +685,7 @@ impl Settings {
         g.line(rx + 14.0, y + 60.0, right, y + 60.0, p.divider, 1.0);
 
         // info
-        let y = py + 232.0;
+        let y = py + 280.0;
         let rec = cfg.binds[4].iter().find(|b| b.is_set()).map(|b| b.name()).unwrap_or_else(|| "tray menu".into());
         let clip = cfg.binds[5].iter().find(|b| b.is_set()).map(|b| b.name()).unwrap_or_else(|| "tray menu".into());
         g.text(&format!("Record: {rec}   ·   Save clip: {clip}"), rx + 16.0, y, rwid - 32.0, 18.0, 11.5, p.text, SEMI);
@@ -628,16 +694,16 @@ impl Settings {
             rx + 16.0,
             y + 22.0,
             rwid - 32.0,
-            64.0,
+            50.0,
             10.5,
             p.text3,
             WRAP,
         );
         if cfg.replay {
             let r = crate::media::primary_rect();
-            let (w, h) = ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
+            let (w, h) = crate::media::scaled_size((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32, cfg.res);
             let mb = crate::media::bitrate(w, h, cfg.fps) as u64 * (cfg.replay_secs as u64 + 8) / 8 / 1_000_000;
-            g.text(&format!("Buffer: about {mb} MB of temporary disk space, no extra memory."), rx + 16.0, y + 90.0, rwid - 32.0, 18.0, 10.5, p.text2, 0);
+            g.text(&format!("Buffer: about {mb} MB of temporary disk space, no extra memory."), rx + 16.0, y + 74.0, rwid - 32.0, 18.0, 10.5, p.text2, 0);
         }
     }
 
@@ -680,10 +746,70 @@ impl Settings {
         );
     }
 
+    /// Apply (or, if it doesn't parse, drop) the number being typed.
+    unsafe fn commit_edit(&mut self) {
+        let Some(e) = self.edit.take() else { return };
+        let a = app();
+        match e.field {
+            Field::Clip => {
+                if let Some(v) = config::parse_secs(&e.text) {
+                    set_clip(v.clamp(config::CLIP_MIN, config::CLIP_MAX));
+                }
+            }
+            Field::Fps => {
+                let t = e.text.trim().to_ascii_lowercase();
+                if let Ok(v) = t.trim_end_matches("fps").trim().parse::<f32>() {
+                    set_fps((v.round() as u32).clamp(config::FPS_MIN, config::FPS_MAX));
+                }
+            }
+        }
+        a.cfg.save();
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+
+    unsafe fn on_char(&mut self, ch: u32) {
+        let Some(e) = &mut self.edit else { return };
+        match ch {
+            8 => {
+                if e.fresh {
+                    e.text.clear();
+                } else {
+                    e.text.pop();
+                }
+                e.fresh = false;
+            }
+            13 => return self.commit_edit(),
+            27 => self.edit = None,
+            c => {
+                let Some(c) = char::from_u32(c) else { return };
+                let ok = match e.field {
+                    Field::Clip => c.is_ascii_digit() || matches!(c, ':' | '.' | ' ' | 'm' | 'M' | 's' | 'S' | 'i' | 'n' | 'e' | 'c'),
+                    Field::Fps => c.is_ascii_digit() || c == '.',
+                };
+                if !ok {
+                    return;
+                }
+                if e.fresh {
+                    e.text.clear();
+                    e.fresh = false;
+                }
+                if e.text.chars().count() < 8 {
+                    e.text.push(c);
+                }
+            }
+        }
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+
     unsafe fn click(&mut self, hit: Hit) {
         let a = app();
         let was = self.recording;
         self.stop_recording();
+        let editing = self.edit.as_ref().map(|e| e.field);
+        let own = matches!((editing, hit), (Some(Field::Clip), Hit::ClipEdit) | (Some(Field::Fps), Hit::FpsEdit));
+        if !own {
+            self.commit_edit();
+        }
         match hit {
             Hit::Tab(t) => self.tab = t,
             Hit::Bind(i, s) => {
@@ -741,18 +867,17 @@ impl Settings {
                 app::replay_apply();
                 app::refresh_tray();
             }
-            Hit::ClipMinus | Hit::ClipPlus => {
-                let steps = config::CLIP_STEPS;
-                let i = steps.iter().position(|s| *s >= a.cfg.replay_secs).unwrap_or(3);
-                let j = if hit == Hit::ClipPlus { (i + 1).min(steps.len() - 1) } else { i.saturating_sub(1) };
-                a.cfg.replay_secs = steps[j];
-                if a.cfg.replay {
-                    app::replay_apply();
+            Hit::ClipMinus | Hit::ClipPlus => set_clip(config::step(&config::CLIP_STEPS, a.cfg.replay_secs, hit == Hit::ClipPlus)),
+            Hit::FpsMinus | Hit::FpsPlus => set_fps(config::step(&config::FPS_STEPS, a.cfg.fps, hit == Hit::FpsPlus)),
+            Hit::ClipEdit | Hit::FpsEdit => {
+                if !own {
+                    let (field, text) = if hit == Hit::ClipEdit { (Field::Clip, a.cfg.replay_secs.to_string()) } else { (Field::Fps, a.cfg.fps.to_string()) };
+                    self.edit = Some(Edit { field, text, fresh: true });
                 }
             }
-            Hit::Fps(f) => {
-                if a.cfg.fps != f {
-                    a.cfg.fps = f;
+            Hit::Res(r) => {
+                if a.cfg.res != r {
+                    a.cfg.res = r;
                     if a.cfg.replay {
                         crate::media::stop_replay();
                         app::replay_apply();
@@ -784,6 +909,27 @@ impl Settings {
         }
         a.cfg.save();
         InvalidateRect(self.hwnd, null(), 0);
+    }
+}
+
+unsafe fn set_clip(v: u32) {
+    let a = app();
+    if a.cfg.replay_secs != v {
+        a.cfg.replay_secs = v;
+        if a.cfg.replay {
+            app::replay_apply();
+        }
+    }
+}
+
+unsafe fn set_fps(f: u32) {
+    let a = app();
+    if a.cfg.fps != f {
+        a.cfg.fps = f;
+        if a.cfg.replay {
+            crate::media::stop_replay();
+            app::replay_apply();
+        }
     }
 }
 
@@ -894,7 +1040,13 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             let (x, y) = lparam_xy(lp);
             if let Some(hit) = st.hit(x as f32 / s, y as f32 / s) {
                 st.click(hit);
+            } else {
+                st.commit_edit();
             }
+            0
+        }
+        WM_CHAR => {
+            st.on_char(wp as u32);
             0
         }
         WM_RBUTTONUP => {
@@ -907,6 +1059,9 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             0
         }
         WM_KEYDOWN => {
+            if st.edit.is_some() {
+                return 0; // Enter / Esc / text arrive as WM_CHAR
+            }
             if wp == 0x1B {
                 DestroyWindow(h);
             }
@@ -924,9 +1079,13 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                 st.stop_recording();
                 InvalidateRect(h, null(), 0);
             }
+            if wp & 0xFFFF == 0 {
+                st.commit_edit();
+            }
             DefWindowProcW(h, m, wp, lp)
         }
         WM_DESTROY => {
+            st.edit = None;
             st.stop_recording();
             st.hwnd = null_mut();
             st.thumbs.clear();
