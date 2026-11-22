@@ -1,16 +1,30 @@
 # Aperture
 
 An ultra-lightweight screenshot and screen-recording tool for Windows 10/11, written in Rust with raw Win32, GDI+, Direct3D 11 and Media Foundation.
-It has no UI framework and no third-party runtime dependencies. It ships as a single exe of about 760 KB that uses about 6 MB of RAM while idle.
+It has no UI framework and no third-party runtime dependencies. It ships as a single exe of about 760 KB that uses about 3-6 MB of RAM while idle.
 
-## Install (you and friends)
+## Build
 
-1. Send them **`dist/Aperture-Setup.exe`** (a single file).
-2. They double-click it and press **Install**. No admin rights are needed.
+```
+cargo build --release
+copy target\release\Aperture.exe dist\Aperture-Setup.exe
+```
+
+- `Aperture.exe --portable` runs without installing, which is handy for development.
+- `Aperture.exe --record` / `--clip` / `--region` / `--freeform` / `--full` send commands to the running Aperture.
+- `Aperture.exe --probe video.mp4 frame.png` (developer tool) decodes a frame from a video to check recordings.
+- `Aperture.exe --write-icon assets\aperture.ico` regenerates the camera icon from the vector drawing code in `src/icons.rs`. Rebuild afterwards to embed it.
+
+## What if I wanted to install instead? (Installation)
+
+1. Go to **`releases/latest`** (or look at Releases on side of Aperture repo and click the latest build). The install includes binary for installer, if you don't trust it, just build it yourself following the build instructions above.
+
+You can also download the Installer from **`dist/Aperture-Setup.exe`** (a single file), OR go to Releases and download latest version.
+2. Double-click it and press **Install**. No admin rights are needed.
    - Windows SmartScreen may say "Windows protected your PC" because the exe isn't code-signed.
      Click **More info → Run anyway**.
 
-The installer:
+The installer will then do:
 - copies Aperture to `%LOCALAPPDATA%\Programs\Aperture`
 - adds a Start-menu shortcut and starts Aperture with Windows
 - registers it in **Settings → Apps → Installed apps**, where it can be uninstalled
@@ -90,19 +104,8 @@ Pictures then look like the screen instead of over-bright. SDR monitors use the 
 
 Settings and history live in `%APPDATA%\Aperture`.
 
-## Build
-
-```
-cargo build --release
-copy target\release\Aperture.exe dist\Aperture-Setup.exe
-```
-
-- `Aperture.exe --portable` runs without installing, which is handy for development.
-- `Aperture.exe --record` / `--clip` / `--region` / `--freeform` / `--full` send commands to the running Aperture.
-- `Aperture.exe --probe video.mp4 frame.png` (developer tool) decodes a frame from a video to check recordings.
-- `Aperture.exe --write-icon assets\aperture.ico` regenerates the camera icon from the vector drawing code in `src/icons.rs`. Rebuild afterwards to embed it.
-
 ## Notes
 
 - Windows doesn't let normal apps see keys pressed inside an *admin* window. While an elevated app has focus, Windows' own Win+Shift+S runs instead.
 - Captures are physical-pixel exact on mixed-DPI multi-monitor setups.
+- There's not setting to change resolution for recording, only 30/60 FPS for now.
