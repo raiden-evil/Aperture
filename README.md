@@ -21,7 +21,7 @@ copy target\release\Aperture.exe dist\Aperture-Setup.exe
 
 1. Go to **[Releases/latest](https://github.com/raiden-evil/aperture/releases/latest)** (or look at Releases on side of Aperture repo and click the latest build). The install includes binary for installer, if you don't trust it, just build it yourself following the build instructions above.
 
-You can also download the Installer from **`dist/Aperture-Setup.exe`** (a single file), OR go to Releases and download latest version.
+You can also download the Installer from **`dist/Aperture-Setup.exe`** (a single file)
 2. Double-click it and press **Install**. No admin rights are needed.
    - Windows SmartScreen may say "Windows protected your PC" because the exe isn't code-signed.
      Click **More info → Run anyway**.
