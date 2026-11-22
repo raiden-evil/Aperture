@@ -460,7 +460,6 @@ impl App {
                 }
             }
             Cmd::BindsChanged => self.apply_binds(),
-            Cmd::Notify(t, b) => output::notify(&t, &b, "aperture", None),
         }
         let _ = el;
     }
@@ -616,8 +615,13 @@ impl ApplicationHandler<UserEvent> for App {
 
     /// While video is running: blink the pill and notice pipelines that ended by themselves.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // scroll-wheel labels on the overlay fade after a moment
+        let hint = self.overlays.iter_mut().filter_map(|o| o.tick()).min();
         if self.rec.is_none() && self.replay.is_none() {
-            el.set_control_flow(ControlFlow::Wait);
+            el.set_control_flow(match hint {
+                Some(t) => ControlFlow::WaitUntil(t),
+                None => ControlFlow::Wait,
+            });
             return;
         }
         let now = Instant::now();
@@ -634,6 +638,6 @@ impl ApplicationHandler<UserEvent> for App {
                 output::notify("Replay clips stopped", "Screen sharing ended. Toggle Replay clips to restart it.", "aperture", None);
             }
         }
-        el.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
+        el.set_control_flow(ControlFlow::WaitUntil(hint.map_or(self.next_tick, |h| h.min(self.next_tick))));
     }
 }

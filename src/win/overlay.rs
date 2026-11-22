@@ -87,7 +87,8 @@ enum Btn {
 enum Ann {
     Line { a: (f32, f32), b: (f32, f32), c: u32, w: f32, arrow: bool },
     Stroke { pts: Vec<(f32, f32)>, c: u32, w: f32 },
-    Blur(RECT),
+    /// area and strength (1.0 = normal)
+    Blur(RECT, f32),
     Censor(RECT),
     Text { x: f32, y: f32, s: String, c: u32, size: f32 },
 }
@@ -142,6 +143,12 @@ pub struct Overlay {
     layer_box: RECT,
     /// part of `work` that differs from `shot`
     dirty: RECT,
+    /// line / arrow / pencil thickness (before UI scaling) and blur strength; the scroll wheel changes them
+    width: f32,
+    blur_k: f32,
+    wheel: i32,
+    /// short-lived label by the cursor ("Thickness 6")
+    hint: Option<String>,
 }
 
 pub static OV: G<Overlay> = G::new();
@@ -193,6 +200,10 @@ pub unsafe fn init(hinst: HINSTANCE) {
         layer: Vec::new(),
         layer_box: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         dirty: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        width: 4.0,
+        blur_k: 1.0,
+        wheel: 0,
+        hint: None,
     });
 }
 
@@ -267,12 +278,12 @@ fn tip(b: Btn) -> &'static str {
         Btn::Mode(Mode::Region) => "Region   R",
         Btn::Mode(Mode::Free) => "Freeform   F",
         Btn::Mode(Mode::Full) => "Full screen   W",
-        Btn::Tool(Tool::Text) => "Text   T",
-        Btn::Tool(Tool::Blur) => "Blur   B",
+        Btn::Tool(Tool::Text) => "Text   T   ·   Shift+Enter for a new line",
+        Btn::Tool(Tool::Blur) => "Blur   B   ·   scroll for strength",
         Btn::Tool(Tool::Censor) => "Black bar   X",
-        Btn::Tool(Tool::Arrow) => "Arrow   A",
-        Btn::Tool(Tool::Line) => "Line   L",
-        Btn::Tool(Tool::Pen) => "Pencil   P",
+        Btn::Tool(Tool::Arrow) => "Arrow   A   ·   scroll for thickness",
+        Btn::Tool(Tool::Line) => "Line   L   ·   scroll for thickness",
+        Btn::Tool(Tool::Pen) => "Pencil   P   ·   scroll for thickness",
         Btn::Color => "Color   C",
         Btn::Undo => "Undo   Ctrl+Z",
         Btn::Save => "Save to folder   Ctrl+S",
@@ -397,7 +408,7 @@ impl Overlay {
             .iter()
             .chain(self.pending.iter())
             .filter_map(|a| match a {
-                Ann::Blur(rc) | Ann::Censor(rc) => Some(inter(rc, &b)),
+                Ann::Blur(rc, _) | Ann::Censor(rc) => Some(inter(rc, &b)),
                 _ => None,
             })
             .filter(|r| rw(r) > 0 && rh(r) > 0)
@@ -435,13 +446,13 @@ impl Overlay {
             for a in self.anns.iter().chain(self.pending.iter()) {
                 let pad = |w: f32| (w * 3.2 + 10.0).ceil() as i32;
                 match a {
-                    Ann::Blur(rc) | Ann::Censor(rc) => {
+                    Ann::Blur(rc, _) | Ann::Censor(rc) => {
                         let rr = inter(rc, &bound);
                         if rw(&rr) <= 0 || rh(&rr) <= 0 {
                             continue;
                         }
-                        if let Ann::Blur(_) = a {
-                            let rad = ((rw(&rr).min(rh(&rr)) / 5).clamp(4, 14) as f32 * self.s.max(1.0)) as usize;
+                        if let Ann::Blur(_, k) = a {
+                            let rad = (((rw(&rr).min(rh(&rr)) / 5).clamp(4, 14) as f32 * self.s.max(1.0) * k) as usize).clamp(1, 120);
                             box_blur(wp, stride, &rr, rad);
                         } else {
                             for y in rr.top..rr.bottom {
@@ -723,8 +734,23 @@ impl Overlay {
             let size = 26.0 * s;
             let c = PALETTE[self.color];
             draw_text_ann(&g, t.x, t.y, &t.s, c, size);
-            let (tw, th) = if t.s.is_empty() { (0.0, size * 1.2) } else { g.measure_at(&t.s, size, SEMI) };
-            g.line(t.x + tw + 2.0, t.y + 2.0, t.x + tw + 2.0, t.y + th, c, 2.0 * s);
+            // caret at the end of the last line (Shift+Enter starts a new one)
+            let lines = t.s.split('\n').count() as f32;
+            let last = t.s.rsplit('\n').next().unwrap_or("");
+            let lh = g.measure_at("Ag", size, SEMI).1;
+            let tw = if last.is_empty() { 0.0 } else { g.measure_at(last, size, SEMI).0 };
+            let ty = t.y + (lines - 1.0) * lh;
+            g.line(t.x + tw + 2.0, ty + 2.0, t.x + tw + 2.0, ty + lh, c, 2.0 * s);
+        }
+
+        // what the scroll wheel just changed
+        if let Some(h) = &self.hint {
+            let (tw, _) = g.measure_at(h, 12.0 * s, SEMI);
+            let (bw, bh) = (tw + 18.0 * s, 24.0 * s);
+            let bx = (self.cur.0 as f32 + 18.0 * s).min(self.w as f32 - bw - 4.0);
+            let by = (self.cur.1 as f32 + 18.0 * s).min(self.h as f32 - bh - 4.0);
+            g.fill(&Path::rrect(bx, by, bw, bh, bh / 2.0), 0xE6141518);
+            g.text(h, bx, by, bw, bh, 12.0 * s, 0xFFFFFFFF, SEMI | CENTER);
         }
 
         // toolbar / mode bar
@@ -980,12 +1006,12 @@ impl Overlay {
                 t => {
                     let p = self.clamp_pt(x, y);
                     let c = PALETTE[self.color];
-                    let w = 4.0 * self.s;
+                    let w = self.width * self.s;
                     self.pending = Some(match t {
                         Tool::Arrow => Ann::Line { a: p, b: p, c, w, arrow: true },
                         Tool::Line => Ann::Line { a: p, b: p, c, w, arrow: false },
                         Tool::Pen => Ann::Stroke { pts: vec![p], c, w },
-                        Tool::Blur => Ann::Blur(norm((x, y), (x, y))),
+                        Tool::Blur => Ann::Blur(norm((x, y), (x, y)), self.blur_k),
                         _ => Ann::Censor(norm((x, y), (x, y))),
                     });
                     self.start = (x, y);
@@ -1065,7 +1091,7 @@ impl Overlay {
                             }
                         }
                     }
-                    Some(Ann::Blur(r)) | Some(Ann::Censor(r)) => *r = norm(start, (x, y)),
+                    Some(Ann::Blur(r, _)) | Some(Ann::Censor(r)) => *r = norm(start, (x, y)),
                     _ => {}
                 }
                 self.render_work();
@@ -1125,7 +1151,7 @@ impl Overlay {
                 if let Some(p) = self.pending.take() {
                     let keep = match &p {
                         Ann::Line { a, b, .. } => (a.0 - b.0).abs() + (a.1 - b.1).abs() > 3.0,
-                        Ann::Blur(r) | Ann::Censor(r) => rw(r) > 2 && rh(r) > 2,
+                        Ann::Blur(r, _) | Ann::Censor(r) => rw(r) > 2 && rh(r) > 2,
                         _ => true,
                     };
                     if keep {
@@ -1188,12 +1214,47 @@ impl Overlay {
         }
     }
 
+    /// Scroll wheel: thickness for line / arrow / pencil, strength for blur.
+    unsafe fn on_wheel(&mut self, delta: i32) {
+        if !self.editing {
+            return;
+        }
+        self.wheel += delta;
+        let steps = self.wheel / 120;
+        if steps == 0 {
+            return;
+        }
+        self.wheel -= steps * 120;
+        match self.tool {
+            Tool::Arrow | Tool::Line | Tool::Pen => {
+                self.width = (self.width + steps as f32).clamp(1.0, 30.0);
+                let w = self.width * self.s;
+                if let Some(Ann::Line { w: pw, .. } | Ann::Stroke { w: pw, .. }) = &mut self.pending {
+                    *pw = w;
+                }
+                self.hint = Some(format!("Thickness {}", self.width as i32));
+            }
+            Tool::Blur => {
+                self.blur_k = (self.blur_k * 1.25f32.powi(steps)).clamp(0.25, 6.0);
+                if let Some(Ann::Blur(_, k)) = &mut self.pending {
+                    *k = self.blur_k;
+                }
+                self.hint = Some(format!("Blur {}%", (self.blur_k * 100.0).round() as i32));
+            }
+            _ => return,
+        }
+        SetTimer(self.hwnd, 7, 1100, None);
+        self.render_work();
+        self.redraw();
+    }
+
     unsafe fn on_char(&mut self, ch: u32) {
         let Some(t) = &mut self.text else { return };
         match ch {
             8 => {
                 t.s.pop();
             }
+            13 if GetKeyState(0x10) < 0 => t.s.push('\n'), // Shift+Enter: new line
             13 => {
                 self.commit_text();
             }
@@ -1269,6 +1330,16 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             } else {
                 ov.on_down(x, y);
             }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            ov.on_wheel(((wp >> 16) & 0xFFFF) as u16 as i16 as i32);
+            0
+        }
+        WM_TIMER if wp == 7 => {
+            KillTimer(h, 7);
+            ov.hint = None;
+            ov.redraw();
             0
         }
         WM_RBUTTONDOWN => {

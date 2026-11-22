@@ -10,6 +10,8 @@ pub struct Config {
     pub override_keys: bool,
     /// [action][slot]; actions: 0 region, 1 freeform, 2 full screen, 3 instant capture, 4 record, 5 save clip
     pub binds: [[Bind; 2]; 6],
+    /// ask before accepting a shortcut without Ctrl, Alt or Win
+    pub warn_plain: bool,
     pub theme: u8,
     pub replay: bool,
     pub replay_secs: u32,
@@ -91,8 +93,9 @@ impl Bind {
     pub fn is_set(&self) -> bool {
         self.vk != 0
     }
-    /// Plain keys are only allowed for keys nobody types with (PrtSc, F-keys, Pause, ScrLk);
-    /// everything else needs Ctrl, Alt or Win so it can't hijack normal typing.
+    /// True when the shortcut can't get in the way of typing: it uses Ctrl, Alt or
+    /// Win, or a key nobody types with (PrtSc, F-keys, Pause, ScrLk). Other keys are
+    /// allowed too, after a warning.
     pub fn valid(&self) -> bool {
         let special = matches!(self.vk, 0x2C | 0x13 | 0x91 | 0x70..=0x87);
         self.vk != 0 && (special || self.mods & (M_WIN | M_CTRL | M_ALT) != 0)
@@ -159,7 +162,7 @@ fn parse_binds(v: &str) -> [Bind; 2] {
     for (i, part) in v.split(',').take(2).enumerate() {
         if let Some((m, k)) = part.trim().split_once(':') {
             let b = Bind::new(m.parse().unwrap_or(0), k.parse().unwrap_or(0));
-            if b.valid() {
+            if b.is_set() {
                 out[i] = b;
             }
         }
@@ -188,6 +191,7 @@ impl Config {
     pub fn load() -> Config {
         let mut c = Config { copy: true, save: true, folder: Self::default_folder(), override_keys: true,
             binds: DEFAULT_BINDS,
+            warn_plain: true,
             theme: 0,
             replay: false,
             replay_secs: 60,
@@ -203,6 +207,7 @@ impl Config {
                         "copy" => c.copy = v == "1",
                         "save" => c.save = v == "1",
                         "override" => c.override_keys = v == "1",
+                        "warn_plain_keys" => c.warn_plain = v == "1",
                         "folder" if !v.is_empty() => c.folder = v.to_string(),
                         "video_folder" if !v.is_empty() => c.video_folder = v.to_string(),
                         "theme" => c.theme = v.parse::<u8>().unwrap_or(0).min(2),
@@ -226,7 +231,7 @@ impl Config {
         let _ = std::fs::create_dir_all(&d);
         let b = |v: bool| if v { "1" } else { "0" };
         let mut s = format!(
-            "copy={}\nsave={}\noverride={}\nfolder={}\nvideo_folder={}\ntheme={}\nreplay={}\nreplay_secs={}\nfps={}\nres={}\n",
+            "copy={}\nsave={}\noverride={}\nfolder={}\nvideo_folder={}\ntheme={}\nreplay={}\nreplay_secs={}\nfps={}\nres={}\nwarn_plain_keys={}\n",
             b(self.copy),
             b(self.save),
             b(self.override_keys),
@@ -236,7 +241,8 @@ impl Config {
             b(self.replay),
             self.replay_secs,
             self.fps,
-            self.res
+            self.res,
+            b(self.warn_plain)
         );
         for (i, k) in ACTION_KEYS.iter().enumerate() {
             let [a, c] = self.binds[i];

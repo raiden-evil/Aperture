@@ -73,7 +73,7 @@ Windows' own screenshot shortcuts come back. Screenshots you saved are kept.
 
 All shortcuts can be changed in **Settings → Shortcuts**. Each action has two slots.
 Click a key box and press the new combination: Backspace removes a shortcut and Esc cancels.
-Letters and numbers need Ctrl, Alt or Win. PrtSc and the F-keys also work on their own.
+Shortcuts without Ctrl, Alt or Win (like a plain letter) are allowed after a warning, since they fire even while you type elsewhere. You can turn the warning off in the Shortcuts tab. PrtSc and the F-keys never ask.
 **Full screen** (the monitor under the cursor, with editing) has no shortcut by default.
 
 The defaults are:
@@ -92,7 +92,8 @@ The defaults are:
 - **Choosing an area:** `R` Region · `F` Freeform · `W` Full screen · `V` Record video. Click without dragging to capture the whole monitor.
 - **Tools:** `T` Text · `B` Blur · `X` Black bar · `A` Arrow · `L` Line · `P` Pencil (freehand) · `C` Change color.
 - **Editing:** `Ctrl+Z` Undo · Right-click to reselect.
-- **Finishing:** `Enter` or double-click to copy (and save, if that's on) · `Ctrl+S` Save to folder · `Esc` Cancel.
+- **Finishing:** `Enter`, `Ctrl+C` or double-click to copy (and save, if that's on) · `Ctrl+S` Save to folder · `Esc` Cancel.
+- **Adjusting:** scroll the mouse wheel to change the thickness of lines, arrows and pencil strokes, or the strength of the blur. `Shift+Enter` starts a new line in text.
 
 ## Tray & settings
 
@@ -153,6 +154,6 @@ If you don't feel safe or doesn't trust this program, simply read source code, b
 
 **Planned Features?**
 
-I might be adding settings for changing resolution on recording, as well allow for more freedom in changing time for Replay clips to be whatever instead of incremental increase/decrease.
+I am probably planning on making some kind of system to allow upload Replay clips to somewhere semi-permament to mimic Medal's clip uploading capablities. Google Drive maybe?
 
 Like I had previously said, Aperture is designed to solve my personal problems. Beyond all current features of Aperture, I don't really think there's anything else that I feel I should add or even have any idea in general. I feel all features that's currently avaliable in 1.0.2 of Aperture should enough for everybody. Screenshotting, recording, replay clips of something from past, with quick tools for modifying images & clipboard history, settings to change keybinds. I think this app really have everything that is probably needed for fast & functionally taking pictures/videos.

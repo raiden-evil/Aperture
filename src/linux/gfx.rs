@@ -454,16 +454,25 @@ impl Gfx {
             ty += lh;
         }
     }
-    /// Unbounded text whose top-left is (x,y).
+    /// Unbounded text whose top-left is (x,y); '\n' starts a new line.
     pub fn text_at(&self, s: &str, x: f32, y: f32, size: f32, c: u32, fl: u32) {
         let Some(font) = font_for(fl) else { return };
-        let (ascent, _) = line_height(font, size);
-        self.draw_line_at(font, s, x, y + ascent, size, c);
+        let (ascent, lh) = line_height(font, size);
+        let lh = lh.max(size * 1.2); // same spacing measure_at reports
+        for (i, line) in s.split('\n').enumerate() {
+            self.draw_line_at(font, line, x, y + ascent + i as f32 * lh, size, c);
+        }
     }
+    /// Width of the widest line and the height of all lines.
     pub fn measure_at(&self, s: &str, size: f32, fl: u32) -> (f32, f32) {
-        let Some(font) = font_for(fl) else { return (s.chars().count() as f32 * size * 0.55, size * 1.2) };
+        let n = s.split('\n').count() as f32;
+        let Some(font) = font_for(fl) else {
+            let w = s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * size * 0.55;
+            return (w, size * 1.2 * n);
+        };
         let (_, lh) = line_height(font, size);
-        (advance(font, size, s), lh.max(size * 1.2))
+        let w = s.split('\n').map(|l| advance(font, size, l)).fold(0.0, f32::max);
+        (w, lh.max(size * 1.2) * n)
     }
 
     /// Draws `img` covering the destination rect (center-cropped).

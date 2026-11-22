@@ -45,6 +45,10 @@ enum Hit {
     FpsPlus,
     FpsEdit,
     Res(u32),
+    WarnPlain,
+    ConfirmYes,
+    ConfirmNo,
+    ConfirmNever,
     VideoFolder,
     OpenVideoFolder,
     Theme(u8),
@@ -86,6 +90,8 @@ pub struct Settings {
     tab: u8,
     recording: Option<(usize, usize)>,
     edit: Option<Edit>,
+    /// a single-key shortcut waiting for "Use anyway": (action, slot, shortcut, don't ask again)
+    confirm: Option<(usize, usize, config::Bind, bool)>,
 }
 
 static SET: G<Settings> = G::new();
@@ -279,6 +285,7 @@ pub unsafe fn show() {
             tab: 0,
             recording: None,
             edit: None,
+            confirm: None,
         });
     }
     let st = SET.get();
@@ -296,6 +303,7 @@ pub unsafe fn show() {
     st.autostart = config::autostart();
     st.hover = None;
     st.edit = None;
+    st.confirm = None;
     let hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         wz(CLASS).as_ptr(),
@@ -341,29 +349,53 @@ pub unsafe fn on_recorded(packed: usize) {
     } else if b.mods == 0 && (b.vk == 0x08 || b.vk == 0x2E) {
         cfg.binds[a][s] = config::Bind::NONE;
         changed = true;
-    } else if !b.valid() {
-        toast::show(None, "Add Ctrl, Alt or Win", &format!("{} on its own would get in the way of typing", b.name()), None);
+    } else if !b.valid() && cfg.warn_plain {
+        st.confirm = Some((a, s, b, false)); // ask first
     } else {
-        for slot in cfg.binds.iter_mut().flatten() {
-            if *slot == b {
-                *slot = config::Bind::NONE; // a shortcut can only do one thing
-            }
-        }
-        cfg.binds[a][s] = b;
-        changed = true;
+        set_bind(a, s, b);
     }
     if changed {
-        for row in cfg.binds.iter_mut() {
-            if !row[0].is_set() && row[1].is_set() {
-                row.swap(0, 1);
-            }
-        }
-        cfg.save();
-        config::apply_binds(cfg);
-        app::refresh_tray();
+        save_binds();
     }
     if !st.hwnd.is_null() {
         InvalidateRect(st.hwnd, null(), 0);
+    }
+}
+
+/// Stores a shortcut (taking it away from any other action that had it).
+unsafe fn set_bind(a: usize, s: usize, b: config::Bind) {
+    let cfg = &mut app().cfg;
+    for slot in cfg.binds.iter_mut().flatten() {
+        if *slot == b {
+            *slot = config::Bind::NONE; // a shortcut can only do one thing
+        }
+    }
+    cfg.binds[a][s] = b;
+    save_binds();
+}
+
+unsafe fn save_binds() {
+    let cfg = &mut app().cfg;
+    for row in cfg.binds.iter_mut() {
+        if !row[0].is_set() && row[1].is_set() {
+            row.swap(0, 1);
+        }
+    }
+    cfg.save();
+    config::apply_binds(cfg);
+    app::refresh_tray();
+}
+
+/// Little square checkbox.
+fn checkbox(g: &Gfx, x: f32, y: f32, on: bool, hover: bool) {
+    let p = pal();
+    let r = Path::rrect(x, y, 18.0, 18.0, 5.0);
+    if on {
+        g.fill_v(&r, y, y + 18.0, 0xFF4D96FF, 0xFF1A59CC);
+        g.polyline(&[(x + 4.5, y + 9.5), (x + 7.8, y + 12.8), (x + 13.5, y + 5.8)], 0xFFFFFFFF, 2.0);
+    } else {
+        g.fill_v(&r, y, y + 18.0, p.btn0, if hover { p.btn_hover1 } else { p.btn1 });
+        g.stroke(&r, p.btn_line, 1.0);
     }
 }
 
@@ -525,6 +557,40 @@ impl Settings {
             let un = [lx, H - 30.0, 130.0, 20.0];
             g.text("Uninstall Aperture", un[0], un[1], un[2], un[3], 11.5, if hv == Some(Hit::Uninstall) { 0xFFE0453A } else { p.text3 }, 0);
             items.push((Hit::Uninstall, un));
+
+            // "use a single key?" confirmation on top of everything
+            if let Some((_, _, b, never)) = self.confirm {
+                items.clear();
+                g.rect(0.0, 0.0, W + 2.0, H + 2.0, if p.dark { 0xA0000000 } else { 0x70000000 });
+                let (mw, mh) = (400.0, 196.0);
+                let (mx, my) = ((W - mw) / 2.0, (H - mh) / 2.0);
+                g.fill(&Path::rrect(mx, my + 4.0, mw, mh, 16.0), 0x40000000);
+                let m = Path::rrect(mx, my, mw, mh, 16.0);
+                g.fill(&m, p.card);
+                g.stroke(&m, p.card_line, 1.0);
+                let name = b.name();
+                g.text(&format!("Use {name} on its own?"), mx + 24.0, my + 20.0, mw - 48.0, 24.0, 16.0, p.text, SEMI);
+                g.text(
+                    &format!("A shortcut without Ctrl, Alt or Win is caught everywhere, so pressing {name} while typing in other apps will start Aperture instead."),
+                    mx + 24.0,
+                    my + 52.0,
+                    mw - 48.0,
+                    54.0,
+                    12.0,
+                    p.text2,
+                    WRAP,
+                );
+                let cb = [mx + 24.0, my + 112.0, 200.0, 22.0];
+                checkbox(&g, cb[0], cb[1] + 2.0, never, hv == Some(Hit::ConfirmNever));
+                g.text("Don't ask again", cb[0] + 28.0, cb[1], 170.0, 22.0, 12.0, p.text, 0);
+                items.push((Hit::ConfirmNever, cb));
+                let yes = [mx + mw - 24.0 - 120.0, my + mh - 50.0, 120.0, 30.0];
+                let no = [yes[0] - 10.0 - 90.0, yes[1], 90.0, 30.0];
+                pill(&g, no[0], no[1], no[2], no[3], "Cancel", false, hv == Some(Hit::ConfirmNo));
+                pill(&g, yes[0], yes[1], yes[2], yes[3], "Use anyway", true, hv == Some(Hit::ConfirmYes));
+                items.push((Hit::ConfirmNo, no));
+                items.push((Hit::ConfirmYes, yes));
+            }
         }
         self.items = items;
         BitBlt(hdc, 0, 0, cw, ch, dc, 0, 0, SRCCOPY);
@@ -607,7 +673,7 @@ impl Settings {
         let ty = py + 6.0 + 6.0 * 46.0 + 6.0;
         if cfg.override_keys {
             g.text(
-                "Click a key, then press the shortcut you want. Backspace removes it, Esc cancels. Letters need Ctrl, Alt or Win; PrtSc and F-keys work alone.",
+                "Click a key, then press the shortcut you want. Backspace removes it, Esc cancels. Keys without Ctrl, Alt or Win work too, after a warning.",
                 rx + 16.0,
                 ty,
                 rwid - 32.0,
@@ -619,9 +685,16 @@ impl Settings {
         } else {
             g.text("Global shortcuts are turned off. Switch them on under Shortcuts on the left.", rx + 16.0, ty, rwid - 32.0, 48.0, 11.0, p.warn, WRAP | SEMI);
         }
-        let rr = [rx + rwid / 2.0 - 70.0, py + ph - 40.0, 140.0, 28.0];
+        let rr = [rx + rwid - 14.0 - 132.0, py + ph - 40.0, 132.0, 28.0];
         pill(g, rr[0], rr[1], rr[2], rr[3], "Reset to defaults", false, hv == Some(Hit::ResetKeys));
         items.push((Hit::ResetKeys, rr));
+        let wr = [rx + 8.0, py + ph - 42.0, rr[0] - rx - 16.0, 32.0];
+        if hv == Some(Hit::WarnPlain) {
+            g.fill(&Path::rrect(wr[0], wr[1], wr[2], wr[3], 8.0), p.hover);
+        }
+        toggle(g, rx + 14.0, py + ph - 38.0, cfg.warn_plain);
+        g.text("Warn about single keys", rx + 66.0, py + ph - 40.0, wr[2] - 60.0, 28.0, 11.5, p.text, 0);
+        items.push((Hit::WarnPlain, wr));
     }
 
     fn paint_recording(&self, g: &Gfx, items: &mut Vec<(Hit, [f32; 4])>, rx: f32, py: f32, rwid: f32) {
@@ -816,6 +889,21 @@ impl Settings {
                 if was != Some((i, s)) {
                     self.recording = Some((i, s));
                     hook::RECORD.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Hit::WarnPlain => a.cfg.warn_plain = !a.cfg.warn_plain,
+            Hit::ConfirmNever => {
+                if let Some(c) = &mut self.confirm {
+                    c.3 = !c.3;
+                }
+            }
+            Hit::ConfirmNo => self.confirm = None,
+            Hit::ConfirmYes => {
+                if let Some((act, slot, b, never)) = self.confirm.take() {
+                    if never {
+                        a.cfg.warn_plain = false;
+                    }
+                    set_bind(act, slot, b);
                 }
             }
             Hit::ResetKeys => {
@@ -1063,7 +1151,15 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                 return 0; // Enter / Esc / text arrive as WM_CHAR
             }
             if wp == 0x1B {
-                DestroyWindow(h);
+                if st.confirm.take().is_some() {
+                    InvalidateRect(h, null(), 0); // Esc answers the question, not the window
+                } else {
+                    DestroyWindow(h);
+                }
+            } else if wp == 0x0D {
+                if st.confirm.is_some() {
+                    st.click(Hit::ConfirmYes);
+                }
             }
             0
         }
