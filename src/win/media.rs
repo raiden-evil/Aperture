@@ -254,37 +254,121 @@ fn srgb_lut() -> &'static [u8] {
     })
 }
 
-/// Soft highlight roll-off: identity below the knee, extended-Reinhard above,
-/// mapping `lw` (the brightest value present) exactly to 1.0. The knee sits high
-/// so SDR content (≤ 1.0 = SDR white) keeps its brightness.
-#[inline]
-fn tonemap(m: f32, lw: f32) -> f32 {
-    const K: f32 = 0.9;
-    if lw <= 1.0 || m <= K {
-        return 1.0;
+// ---- BT.2390 highlight roll-off (EETF) ----
+// HDR is mapped into SDR by treating "SDR white" as the target peak: values well
+// below white pass through unchanged, and everything between the knee and the
+// brightest content is squeezed along a Hermite spline in PQ space, the
+// perceptual scale HDR itself is encoded in. Applied to max(R,G,B) as one ratio
+// for all three channels, so hues stay put.
+
+const PQ_M1: f32 = 0.159_301_76;
+const PQ_M2: f32 = 78.843_75;
+const PQ_C1: f32 = 0.835_937_5;
+const PQ_C2: f32 = 18.851_563;
+const PQ_C3: f32 = 18.6875;
+
+/// Nits → PQ signal (0..1, 10,000 nits = 1).
+fn pq(nits: f32) -> f32 {
+    let y = (nits / 10_000.0).max(0.0).powf(PQ_M1);
+    ((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y)).powf(PQ_M2)
+}
+
+/// PQ signal → nits.
+fn pq_inv(e: f32) -> f32 {
+    let p = e.clamp(0.0, 1.0).powf(1.0 / PQ_M2);
+    ((p - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * p)).powf(1.0 / PQ_M1) * 10_000.0
+}
+
+/// ITU-R BT.2390 EETF: maps `nits` from content peaking at `src_peak` onto a
+/// display peaking at `dst_peak` (both in nits).
+pub fn bt2390(nits: f32, src_peak: f32, dst_peak: f32) -> f32 {
+    if src_peak <= dst_peak {
+        return nits.min(dst_peak);
     }
-    let x = (m - K) / (1.0 - K);
-    let xm = ((lw - K) / (1.0 - K)).max(1.0001);
-    let y = x * (1.0 + x / (xm * xm)) / (1.0 + x);
-    (K + (1.0 - K) * y) / m
+    let lw = pq(src_peak);
+    let e1 = pq(nits.min(src_peak)) / lw;
+    let max_lum = pq(dst_peak) / lw;
+    let ks = (1.5 * max_lum - 0.5).max(0.0);
+    let e2 = if e1 < ks {
+        e1
+    } else {
+        let t = (e1 - ks) / (1.0 - ks);
+        let (t2, t3) = (t * t, t * t * t);
+        (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * max_lum
+    };
+    pq_inv(e2 * lw)
+}
+
+/// Where the BT.2390 curve starts bending, in nits (below it nothing changes).
+fn bt2390_knee(src_peak: f32, dst_peak: f32) -> f32 {
+    let lw = pq(src_peak);
+    pq_inv((1.5 * pq(dst_peak) / lw - 0.5).max(0.0) * lw)
+}
+
+/// The EETF for one screenshot, tabulated: `ratio(m)` scales a pixel whose
+/// brightest channel is `m` (1.0 = SDR white) so it ends up ≤ 1.0.
+struct Eetf {
+    /// brightest value present, relative to SDR white
+    peak: f32,
+    /// output / input for m = peak * i / (N - 1)
+    table: Vec<f32>,
+}
+
+impl Eetf {
+    const N: usize = 4096;
+    fn new(peak: f32, sdr_nits: f32) -> Eetf {
+        let peak = peak.max(1.0);
+        let table = (0..Self::N)
+            .map(|i| {
+                let m = peak * i as f32 / (Self::N - 1) as f32;
+                if m <= 0.0 {
+                    return 1.0;
+                }
+                bt2390(m * sdr_nits, peak * sdr_nits, sdr_nits) / sdr_nits / m
+            })
+            .collect();
+        Eetf { peak, table }
+    }
+    #[inline]
+    fn ratio(&self, m: f32) -> f32 {
+        if self.peak <= 1.0 {
+            return 1.0; // nothing brighter than SDR white on screen
+        }
+        let m = m.min(self.peak); // the panel can't show more than its peak either
+        let f = m / self.peak * (Self::N - 1) as f32;
+        let i = (f as usize).min(Self::N - 2);
+        let t = f - i as f32;
+        self.table[i] * (1.0 - t) + self.table[i + 1] * t
+    }
 }
 
 /// Re-captures every HDR monitor through Desktop Duplication (FP16) and writes
 /// tone-mapped sRGB pixels into `dst` (the virtual-screen image GDI already filled).
 /// SDR monitors are left untouched, so this costs nothing when HDR is off.
 pub fn patch_hdr(vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32]) {
-    let outs = outputs();
-    if !outs.iter().any(|o| o.hdr) {
-        return;
-    }
-    for o in outs.iter().filter(|o| o.hdr && !o.rotated) {
-        unsafe {
-            let _ = grab_hdr(o, vx, vy, vw, vh, dst);
-        }
-    }
+    patch_hdr_report(vx, vy, vw, vh, dst);
 }
 
-unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32]) -> windows::core::Result<()> {
+/// Same as `patch_hdr`, plus one line per HDR monitor saying what happened.
+pub fn patch_hdr_report(vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32]) -> Vec<String> {
+    let outs = outputs();
+    let mut log = Vec::new();
+    for o in outs.iter().filter(|o| o.hdr) {
+        let at = format!("Monitor at {},{}", o.rect.left, o.rect.top);
+        if o.rotated {
+            log.push(format!("{at}: skipped (rotated monitors aren't corrected yet)"));
+            continue;
+        }
+        let r = unsafe { grab_hdr(o, vx, vy, vw, vh, dst) };
+        log.push(match r {
+            Ok(msg) => format!("{at}: {msg}"),
+            Err(e) => format!("{at}: HDR capture failed ({}), the plain Windows capture was kept", e.message()),
+        });
+    }
+    log
+}
+
+unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32]) -> windows::core::Result<String> {
     let (dev, ctx) = device(&o.adapter)?;
     let dup = duplicate(&o.output, &dev)?;
     let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -327,6 +411,7 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
     let base = m.pData as *const u8;
     let ox = o.rect.left - vx;
     let oy = o.rect.top - vy;
+    let mut msg = format!("got an 8-bit image ({:?}), the plain Windows capture was kept", d.Format);
     if d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
         let hl = half_lut();
         let sl = srgb_lut();
@@ -342,6 +427,18 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
             }
         }
         let lw = lmax.min(o.max_nits / o.sdr_nits.max(1.0)).max(1.0);
+        let eetf = Eetf::new(lw, o.sdr_nits.max(1.0));
+        let eetf = &eetf;
+        msg = if lw > 1.0 {
+            format!(
+                "corrected from HDR ({w}x{h}): SDR white {:.0} nits; HDR highlights up to {:.0} nits fitted in with the BT.2390 curve (unchanged below {:.0} nits)",
+                o.sdr_nits,
+                lw * o.sdr_nits,
+                bt2390_knee(lw * o.sdr_nits, o.sdr_nits)
+            )
+        } else {
+            format!("corrected from HDR ({w}x{h}): SDR white {:.0} nits mapped to full white; nothing brighter was on screen, so colors are unchanged", o.sdr_nits)
+        };
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
         let rows_per = h.div_ceil(threads);
         let dst_ptr = dst.as_mut_ptr() as usize;
@@ -365,7 +462,7 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
                             let mut r = (hl[p[0] as usize] * scale).max(0.0);
                             let mut g = (hl[p[1] as usize] * scale).max(0.0);
                             let mut b = (hl[p[2] as usize] * scale).max(0.0);
-                            let k = tonemap(r.max(g).max(b), lw);
+                            let k = eetf.ratio(r.max(g).max(b));
                             r *= k;
                             g *= k;
                             b *= k;
@@ -380,7 +477,7 @@ unsafe fn grab_hdr(o: &Out, vx: i32, vy: i32, vw: i32, vh: i32, dst: &mut [u32])
     // an 8-bit duplication of an HDR desktop is clipped (too bright), so the GDI
     // capture already in `dst` is the better picture: leave it
     ctx.Unmap(&st, 0);
-    Ok(())
+    Ok(msg)
 }
 
 // ---------------------------------------------------------------- video engine
@@ -398,6 +495,14 @@ float3 enc(float3 c) {
     float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
     return lerp(hi, lo, step(c, 0.0031308));
 }
+float pq(float nits) {
+    float y = pow(max(nits / 10000.0, 0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
+}
+float pq_inv(float e) {
+    float p = pow(saturate(e), 1.0 / 78.84375);
+    return pow(max(p - 0.8359375, 0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125) * 10000.0;
+}
 float4 ps(float4 p : SV_Position) : SV_Target {
     float4 c;
     if (k.x > 1.001 || k.y > 1.001) {
@@ -414,14 +519,24 @@ float4 ps(float4 p : SV_Position) : SV_Target {
         c = src.Load(int3(int2(p.xy + off), 0));
     }
     if (hdr > 0.5) {
+        // BT.2390 EETF on max(R,G,B): SDR white is the target peak, `lw` (relative
+        // to SDR white) the source peak; same curve as the screenshot path
         float3 l = max(c.rgb * scale, 0);
-        float m = max(max(l.r, l.g), l.b);
-        const float k = 0.9;
-        if (m > k && lw > 1.0) {
-            float x = (m - k) / (1 - k);
-            float xm = max((lw - k) / (1 - k), 1.0001);
-            float y = x * (1 + x / (xm * xm)) / (1 + x);
-            l *= (k + (1 - k) * y) / m;
+        float m = min(max(max(l.r, l.g), l.b), lw);
+        if (m > 0 && lw > 1.0) {
+            float sdr = 80.0 / scale;
+            float pw = pq(lw * sdr);
+            float e1 = pq(m * sdr) / pw;
+            float ml = pq(sdr) / pw;
+            float ks = max(1.5 * ml - 0.5, 0);
+            float e2 = e1;
+            if (e1 >= ks) {
+                float t = (e1 - ks) / (1 - ks);
+                float t2 = t * t, t3 = t2 * t;
+                e2 = (2 * t3 - 3 * t2 + 1) * ks + (t3 - 2 * t2 + t) * (1 - ks) + (-2 * t3 + 3 * t2) * ml;
+            }
+            float outm = pq_inv(e2 * pw) / sdr;
+            l *= outm / max(max(max(l.r, l.g), l.b), 1e-6);
         }
         return float4(enc(l), 1);
     }

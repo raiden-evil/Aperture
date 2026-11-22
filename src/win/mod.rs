@@ -38,8 +38,27 @@ pub fn main() {
                 return;
             }
             "--hdr-info" => {
-                let path = std::env::temp_dir().join("aperture-hdr.txt");
-                let _ = std::fs::write(&path, media::hdr_report());
+                let dir = std::env::temp_dir();
+                let path = dir.join("aperture-hdr.txt");
+                let mut report = media::hdr_report();
+                if let Some((plain, fixed, log)) = overlay::capture_compare() {
+                    let (a, b) = (dir.join("aperture-hdr-windows.png"), dir.join("aperture-hdr-aperture.png"));
+                    let _ = std::fs::write(&a, gfx::encode_png(&plain));
+                    let _ = std::fs::write(&b, gfx::encode_png(&fixed));
+                    report += "\r\nTest capture just now:\r\n";
+                    for l in &log {
+                        report += &format!("  {l}\r\n");
+                    }
+                    if log.is_empty() {
+                        report += "  no HDR monitor, nothing to correct\r\n";
+                    }
+                    report += &format!(
+                        "\r\nCompare these with what you see on screen:\r\n  {}  (plain Windows capture)\r\n  {}  (Aperture's HDR correction)\r\n",
+                        a.display(),
+                        b.display()
+                    );
+                }
+                let _ = std::fs::write(&path, report);
                 util::open_path(&path.to_string_lossy());
                 return;
             }

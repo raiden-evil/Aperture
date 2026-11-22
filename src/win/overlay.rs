@@ -229,6 +229,17 @@ unsafe fn grab(d: &Dib, vx: i32, vy: i32) {
     GdiFlush();
 }
 
+/// `--hdr-info`: the plain Windows capture, the HDR-corrected one, and what happened.
+pub unsafe fn capture_compare() -> Option<(Img, Img, Vec<String>)> {
+    let (vx, vy, w, h) = virtual_screen();
+    let d = Dib::new(w, h)?;
+    grab(&d, vx, vy);
+    let plain: Vec<u32> = d.px().iter().map(|p| p | 0xFF00_0000).collect();
+    let log = crate::media::patch_hdr_report(vx, vy, w, h, d.px());
+    let fixed: Vec<u32> = d.px().iter().map(|p| p | 0xFF00_0000).collect();
+    Some((Img { w, h, px: plain, alpha: false }, Img { w, h, px: fixed, alpha: false }, log))
+}
+
 /// Instant capture of every monitor, no UI.
 pub unsafe fn capture_virtual() -> Option<Img> {
     let (vx, vy, w, h) = virtual_screen();
