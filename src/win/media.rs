@@ -1132,6 +1132,14 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
         let mut cur = CursorCache { h: 0, hot: (0, 0), size: (32, 32) };
         let mut changed: u64 = 0;
         let mut idle_since: Option<Instant> = None;
+        // Display changes (HDR on/off, resolution, monitors) make DXGI's view stale;
+        // a stale duplication can go silent, which used to freeze replay clips on an
+        // old picture. Watch for both.
+        let mut factory = CreateDXGIFactory1::<IDXGIFactory1>().ok();
+        let mut last_check = Instant::now();
+        let mut last_frame = Instant::now();
+        let mut out = out;
+        let mut hdr = hdr;
         loop {
             // ---- commands
             while let Ok(c) = rx.try_recv() {
@@ -1292,12 +1300,45 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
             }
             idle_since = None;
 
+            // ---- keep the capture healthy
+            if last_check.elapsed() > Duration::from_millis(500) {
+                last_check = Instant::now();
+                if factory.as_ref().is_some_and(|f| !f.IsCurrent().as_bool()) {
+                    // the display setup changed: find this monitor again and re-read its HDR values
+                    factory = CreateDXGIFactory1::<IDXGIFactory1>().ok();
+                    let (cx, cy) = ((out.rect.left + out.rect.right) / 2, (out.rect.top + out.rect.bottom) / 2);
+                    let fresh = outputs().into_iter().find(|o| o.rect == out.rect).or_else(|| {
+                        outputs().into_iter().find(|o| cx >= o.rect.left && cx < o.rect.right && cy >= o.rect.top && cy < o.rect.bottom)
+                    });
+                    if let Some(o) = fresh {
+                        hdr = (o.hdr, 80.0 / o.sdr_nits.max(1.0), o.max_nits / o.sdr_nits.max(1.0));
+                        out = o;
+                    }
+                    dup = None;
+                }
+                if dup.is_some() && last_frame.elapsed() > Duration::from_secs(2) {
+                    // no new picture for a while: reconnect. On a still screen this is
+                    // harmless (a new duplication hands over the current image at once);
+                    // on a duplication that silently died it brings frames back.
+                    dup = duplicate(&out.output, &g.dev).ok();
+                    last_frame = Instant::now();
+                }
+            }
+
             // ---- grab desktop updates until the next frame is due
             let due = t0 + Duration::from_nanos(tick * 1_000_000_000 / fps as u64);
             let wait = due.saturating_duration_since(Instant::now()).as_millis() as u32;
             let Some(d) = &dup else {
-                std::thread::sleep(Duration::from_millis(100));
                 dup = duplicate(&out.output, &g.dev).ok();
+                if dup.is_none() {
+                    std::thread::sleep(Duration::from_millis(100));
+                    // still failing: the output object itself may be stale
+                    if let Some(o) = outputs().into_iter().find(|o| o.rect == out.rect) {
+                        hdr = (o.hdr, 80.0 / o.sdr_nits.max(1.0), o.max_nits / o.sdr_nits.max(1.0));
+                        out = o;
+                    }
+                }
+                last_frame = Instant::now();
                 continue;
             };
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -1346,15 +1387,17 @@ fn engine(mon: RECT, fps: u32, rx: Receiver<Cmd>) {
                     if info.LastPresentTime != 0 || info.LastMouseUpdateTime != 0 {
                         changed = tick;
                     }
+                    if info.LastPresentTime != 0 {
+                        last_frame = Instant::now();
+                    }
                     let _ = d.ReleaseFrame();
                 }
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    dup = None; // desktop switch (UAC, lock screen, mode change): retry
-                    continue;
-                }
                 Err(_) => {
+                    // access lost (UAC, lock screen, mode change) or anything else: reconnect
+                    dup = None;
                     std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
             }
             if Instant::now() < due {

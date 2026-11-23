@@ -9,6 +9,7 @@ pub mod install;
 pub mod media;
 pub mod overlay;
 pub mod rec;
+pub mod selftest;
 pub mod settings;
 pub mod toast;
 pub mod util;
@@ -35,6 +36,12 @@ pub fn main() {
                 if let (Some(i), Some(o)) = (args.get(1), args.get(2)) {
                     media::probe(i, o);
                 }
+                return;
+            }
+            "--test-replay" => {
+                let out = args.get(1).cloned().unwrap_or_else(|| "replay-test.mp4".into());
+                let fps = args.get(2).and_then(|f| f.parse().ok()).unwrap_or(30);
+                selftest::test_replay(&out, fps);
                 return;
             }
             "--hdr-info" => {
